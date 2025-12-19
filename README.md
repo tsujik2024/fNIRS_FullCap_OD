@@ -1,5 +1,5 @@
-# fNIRS_FullCap_2025
-A Python pipeline for preprocessing and analyzing functional Near-Infrared Spectroscopy (fNIRS) data using Octamon devices (Artinis Medical Systems).
+# fNIRS_FullCap_OD
+A Python pipeline for preprocessing and analyzing functional Near-Infrared Spectroscopy (fNIRS) data using Octamon & Brite devices (Artinis Medical Systems).
 
 ---
 
