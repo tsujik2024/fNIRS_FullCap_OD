@@ -1,5 +1,3 @@
-# process_file.py  (FULLY REWRITTEN FOR OD PIPELINE WITH DUAL-PASS SQI)
-# FIXED VERSION - handles HbO/HHb column naming from od_to_concentration
 import os
 import logging
 from pathlib import Path
@@ -249,6 +247,24 @@ class FullCapProcessor:
             # PROCESSED PLOTS (with events!)
             # -------------------------------------------------------------
             self._plot_processed(df_final, out_dir, basename_suffix, events)
+
+            # -------------------------------------------------------------
+            # ADD SAMPLE NUMBER AND EVENT MARKERS
+            # -------------------------------------------------------------
+            if "Sample number" not in df_final.columns:
+                df_final.insert(0, "Sample number", np.arange(len(df_final)))
+
+            df_final["Event"] = ""
+            if not events.empty and "Sample number" in events.columns and "Event" in events.columns:
+                for _, row in events.iterrows():
+                    sample_idx = int(row["Sample number"])
+                    if 0 <= sample_idx < len(df_final):
+                        existing = df_final.at[sample_idx, "Event"]
+                        if existing:
+                            df_final.at[sample_idx, "Event"] = f"{existing};{row['Event']}"
+                        else:
+                            df_final.at[sample_idx, "Event"] = str(row["Event"])
+                logger.info(f"Mapped {len(events)} event markers into output CSV")
 
             # -------------------------------------------------------------
             # SAVE CSV
