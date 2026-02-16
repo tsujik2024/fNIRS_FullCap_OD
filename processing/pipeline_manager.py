@@ -1,4 +1,3 @@
-# pipeline_manager.py — FULLY UPDATED FOR OD PIPELINE
 import os
 import logging
 from typing import List, Dict, Optional, Tuple
