@@ -1,192 +1,234 @@
-# batch.py
-import os
-import logging
-from typing import List, Dict, Tuple, Optional
+"""Batch driver for FullCapProcessor.
 
-from processing.process_file import FullCapProcessor
+Walks a directory of OxySoft .txt exports, groups them by subject (AUT_<NNN>)
+and runs each through the pipeline.
+
+    --quality-only   metrics/report only  -> <rel>/channel_quality/
+    (default)        full pipeline        -> <rel>/with_<method>_filtering/,
+                     or <rel>/no_filtering/ when the criterion is "none"
+
+Gate A (the SD chain in process_file.py) needs two corpus-wide numbers a single
+file can't give it: dataset_median_cardiac_sd and channel_median_cardiac_sd.
+Without them it stays inert. Typical workflow: run once to get quality reports,
+aggregate with statistics.py, then feed its cardiac_sd_by_channel.csv back in
+via --channel-median-cardiac-sd-file for a second pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
+
+from processing.process_file import FullCapProcessor, DEFAULT_HARD_SQI_DISCARD, COMPARISON_METHODS
+from channel_quality.exclusion import (
+    ExclusionCriterion,
+    METHODS,
+    DEFAULT_SQI_THRESHOLD,
+    DEFAULT_SCI_THRESHOLD,
+    DEFAULT_PSP_THRESHOLD,
+    COMBINED_SCI_THRESHOLD,
+    make_criterion,
+)
 
 logger = logging.getLogger(__name__)
 
+_SUBJECT_RE = re.compile(r"AUT_\d{3}")
+
 
 class BatchProcessor:
-    """
-    Batch-level manager for processing all full-cap fNIRS OD-exported .txt files.
-    Uses a two-pass strategy:
-       1) First-pass: estimate y-limits from concentration values
-       2) Second-pass: process files with consistent y-limits
-    """
-
-    def __init__(self, fs: float = 50.0, sci_threshold: float = 0.6):
+    def __init__(
+        self,
+        fs: float = 50.0,
+        criterion: Optional[ExclusionCriterion] = None,
+        quality_only: bool = False,
+        plot_channel_quality: bool = False,
+        comparison_criteria: Optional[Sequence[ExclusionCriterion]] = None,
+        skip_plots: bool = False,
+        hard_sqi_discard: Optional[float] = DEFAULT_HARD_SQI_DISCARD,
+        dataset_median_cardiac_sd: Optional[float] = None,
+        channel_median_cardiac_sd: Optional[Dict[int, float]] = None,
+    ):
         self.fs = fs
-        self.sci_threshold = sci_threshold
-        self.warning_files = []
-        logger.info(f"Initialized BatchProcessor (fs={fs}, SCI threshold={sci_threshold})")
+        self.criterion = criterion if criterion is not None else make_criterion("sqi")
+        self.quality_only = quality_only
+        self.plot_channel_quality = plot_channel_quality
+        self.comparison_criteria: List[ExclusionCriterion] = (
+            list(comparison_criteria) if comparison_criteria is not None
+            else [make_criterion(m) for m in COMPARISON_METHODS]
+        )
+        self.skip_plots = skip_plots
+        self.hard_sqi_discard = hard_sqi_discard
+        self.dataset_median_cardiac_sd = dataset_median_cardiac_sd
+        self.channel_median_cardiac_sd: Dict[int, float] = channel_median_cardiac_sd or {}
+        self.warning_files: List[Tuple[str, str]] = []
 
-    # -------------------------------------------------------------------------
-    #     PUBLIC ENTRY POINT
-    # -------------------------------------------------------------------------
-    def process_batch(self, input_base_dir: str, output_base_dir: str) -> Dict[str, List[str]]:
-        """Process all .txt files under input_base_dir."""
-        os.makedirs(output_base_dir, exist_ok=True)
+    def process_batch(self, input_dir: str | Path, output_dir: str | Path) -> Dict[str, List[str]]:
+        input_dir, output_dir = Path(input_dir), Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        txt_files = self._find_input_files(input_base_dir)
-        if not txt_files:
-            logger.warning(f"No .txt files found in {input_base_dir}")
+        files = sorted(input_dir.rglob("*.txt"))
+        if not files:
+            logger.warning(f"No .txt files found under {input_dir}")
             return {}
 
-        subject_files = self._organize_files_by_subject(txt_files)
+        gate_a = bool(self.dataset_median_cardiac_sd is not None or self.channel_median_cardiac_sd)
+        mode = "quality-only" if self.quality_only else self.criterion.description
+        logger.info(f"{len(files)} files under {input_dir} | {mode} | "
+                    f"hard SQI {self.hard_sqi_discard} | Gate A {'on' if gate_a else 'inert'}")
 
-        processed_files = self._process_subject_files(
-            subject_files, input_base_dir, output_base_dir
-        )
+        subjects = defaultdict(list)
+        for f in files:
+            subjects[self._subject_id(f)].append(f)
 
-        self._save_warnings(output_base_dir)
-        return processed_files
-
-    # -------------------------------------------------------------------------
-    #     PRIVATE HELPERS
-    # -------------------------------------------------------------------------
-    def _find_input_files(self, root: str) -> List[str]:
-        """Return sorted list of all .txt files."""
-        txt_files = []
-        for r, _, files in os.walk(root):
-            for f in files:
-                if f.endswith(".txt"):
-                    txt_files.append(os.path.join(r, f))
-        txt_files.sort()
-        logger.info(f"Found {len(txt_files)} TXT files.")
-        return txt_files
-
-    def _organize_files_by_subject(self, file_paths: List[str]) -> Dict[str, List[str]]:
-        """Group files by subject folder."""
-        subjects = {}
-        for fp in file_paths:
-            subj = self._extract_subject_id(fp)
-            subjects.setdefault(subj, []).append(fp)
-        return subjects
+        results = {name: self._process_subject(name, paths, input_dir, output_dir)
+                   for name, paths in subjects.items()}
+        self._save_warnings(output_dir)
+        return results
 
     @staticmethod
-    def _extract_subject_id(path: str) -> str:
-        """Extract subject ID from folder name."""
-        parts = path.split(os.sep)
-        for p in parts:
-            if "OHSU_Turn" in p or "sub-" in p:
-                return p
-        return "Unknown"
+    def _subject_id(path: Path) -> str:
+        """AUT_<3 digits> anywhere in the path, else the parent dir name."""
+        m = _SUBJECT_RE.search(str(path))
+        return m.group(0) if m else path.parent.name
 
-    # -------------------------------------------------------------------------
-    #     SUBJECT-LEVEL PROCESSING
-    # -------------------------------------------------------------------------
-    def _process_subject_files(
-        self,
-        subject_to_files: Dict[str, List[str]],
-        input_base_dir: str,
-        output_base_dir: str
-    ) -> Dict[str, List[str]]:
+    def _process_subject(self, subject: str, files: List[Path], input_dir: Path, output_dir: Path) -> List[str]:
+        proc = FullCapProcessor(
+            fs=self.fs,
+            criterion=self.criterion,
+            plot_channel_quality=self.plot_channel_quality,
+            comparison_criteria=self.comparison_criteria,
+            skip_plots=self.skip_plots,
+            hard_sqi_discard=self.hard_sqi_discard,
+            dataset_median_cardiac_sd=self.dataset_median_cardiac_sd,
+            channel_median_cardiac_sd=self.channel_median_cardiac_sd,
+        )
+        done = [str(f) for f in files if self._run_one(proc, f, input_dir, output_dir)]
+        self.warning_files.extend(proc.warning_files)
+        logger.info(f"{subject}: {len(done)}/{len(files)} ok")
+        return done
 
-        processed = {}
+    def _run_one(self, proc: FullCapProcessor, path: Path, input_dir: Path, output_dir: Path) -> bool:
+        args = dict(file_path=str(path), output_base_dir=str(output_dir), input_base_dir=str(input_dir))
+        if self.quality_only:
+            return proc.process_file_quality_only(**args) is not None
+        return proc.process_file(**args, apply_filter=self.criterion.method != "none", plot_raw=True) is not None
 
-        for subject, files in subject_to_files.items():
-            logger.info(f"\n===============================")
-            logger.info(f"Processing subject: {subject}")
-            logger.info(f"===============================")
-
-            # ---------- FIRST PASS: extract concentration y-limits ----------
-            y_limits = self._calculate_subject_y_limits(files)
-            logger.info(f"Subject {subject}: y-limits = {y_limits}")
-
-            subject_processed = []
-            processor = FullCapProcessor(fs=self.fs, sci_threshold=self.sci_threshold)
-
-            # ---------- SECOND PASS ----------
-            for fp in files:
-                out = processor.process_file(
-                    file_path=fp,
-                    output_base_dir=output_base_dir,
-                    input_base_dir=input_base_dir,
-                    y_limits=y_limits
-                )
-                if out is not None:
-                    subject_processed.append(fp)
-
-                self.warning_files.extend(processor.warning_files)
-
-            processed[subject] = subject_processed
-            logger.info(f"Subject {subject}: processed {len(subject_processed)} / {len(files)} files.")
-
-        return processed
-
-    # -------------------------------------------------------------------------
-    #     FIRST-PASS Y-LIMIT ESTIMATION
-    # -------------------------------------------------------------------------
-    def _calculate_subject_y_limits(self, file_paths: List[str]) -> Optional[Tuple[float, float]]:
-        """
-        Run a *minimal* first-pass OD→concentration conversion on each file
-        to determine consistent y-axis limits.
-        """
-        from read.loaders import read_txt_file
-        from preprocessing.od_to_concentration import convert_od_to_concentration
-
-        conc_ranges = []
-
-        for fp in file_paths:
-            try:
-                raw = read_txt_file(fp)
-                df = raw["data"]
-                channel_map = raw["channel_map"]
-
-                conc = convert_od_to_concentration(df, channel_map)
-
-                # Identify concentration columns
-                cols = [c for c in conc.columns if "_Hb" in c or "HbO" in c or "HbR" in c]
-                if not cols:
-                    continue
-
-                vmax = conc[cols].abs().max().max()
-                conc_ranges.append(vmax)
-
-            except Exception as e:
-                self.warning_files.append((fp, f"Y-limit error: {str(e)}"))
-                logger.warning(f"Failed y-limit first-pass on {fp}: {e}")
-
-        if not conc_ranges:
-            return None
-
-        max_val = max(conc_ranges) * 1.2
-        return (-max_val, max_val)
-
-    # -------------------------------------------------------------------------
-    #     SAVE WARNING MESSAGES
-    # -------------------------------------------------------------------------
-    def _save_warnings(self, outdir: str) -> None:
-        if not self.warning_files:
-            return
-        warn_path = os.path.join(outdir, "processing_warnings.txt")
-        with open(warn_path, "w") as f:
-            for fp, msg in self.warning_files:
-                f.write(f"{fp}: {msg}\n")
-        logger.info(f"Saved {len(self.warning_files)} warnings → {warn_path}")
+    def _save_warnings(self, output_dir: Path) -> None:
+        if self.warning_files:
+            path = output_dir / "processing_warnings.txt"
+            path.write_text("\n".join(f"{fp}: {msg}" for fp, msg in self.warning_files) + "\n")
+            logger.info(f"Saved {len(self.warning_files)} warnings to {path}")
 
 
-# -------------------------------------------------------------------------
-#     CLI ENTRY POINT
-# -------------------------------------------------------------------------
-def main():
-    import argparse
+def load_channel_median_cardiac_sd(path: str | Path) -> Dict[int, float]:
+    """Per-channel CardiacSD baseline for Gate A, by extension:
+      .json  {"1": 0.004, "2": 0.0038, ...}
+      .csv   'Channel' + 'CardiacSD_Median' columns, i.e. the cardiac_sd_by_channel
+             sheet from statistics.py can be fed straight back in
+    """
+    p = Path(path)
+    if p.suffix.lower() == ".json":
+        return {int(k): float(v) for k, v in json.loads(p.read_text()).items()}
 
-    parser = argparse.ArgumentParser(description="Batch process OD fNIRS TXT files")
-    parser.add_argument("input_dir", help="Input directory containing .txt files")
-    parser.add_argument("output_dir", help="Directory for processed output")
-    parser.add_argument("--fs", type=float, default=50.0)
-    parser.add_argument("--sci_threshold", type=float, default=0.6)
+    if p.suffix.lower() == ".csv":
+        df = pd.read_csv(p)
+        col = next((c for c in ("CardiacSD_Median", "MedianCardiacSD", "Median") if c in df.columns), None)
+        if "Channel" not in df.columns or col is None:
+            raise ValueError(f"{p}: need a 'Channel' column and one of "
+                             f"CardiacSD_Median/MedianCardiacSD/Median, found {list(df.columns)}")
+        df = df[["Channel", col]].apply(pd.to_numeric, errors="coerce").dropna()  # skip junk rows
+        return dict(zip(df["Channel"].astype(int), df[col].astype(float)))
+
+    raise ValueError(f"{p}: unsupported format {p.suffix!r} (use .json or .csv)")
+
+
+# ---- CLI (add_pipeline_args and the *_from_args helpers are shared with cli.main) ----
+
+def add_pipeline_args(parser: argparse.ArgumentParser) -> None:
+    add = parser.add_argument
+    add("--fs", type=float, default=50.0, help="Sampling frequency (Hz)")
+    add("--exclusion-method", choices=METHODS, default="sqi",
+        help="Exclusion criterion: sqi (Sappia 2020), sci (Pollonini 2014), psp (PHOEBE 2016), "
+             "sci_psp (NIRSplot), or none")
+    add("--sqi-threshold", type=float, default=DEFAULT_SQI_THRESHOLD,
+        help="SQI floor (1-5 scale; 2.5 loose, 3.0 standard, 3.5 strict)")
+    add("--sci-threshold", type=float, default=DEFAULT_SCI_THRESHOLD, help="SCI floor for 'sci'")
+    add("--psp-threshold", type=float, default=DEFAULT_PSP_THRESHOLD, help="PSP floor for 'psp' and 'sci_psp'")
+    add("--combined-sci-threshold", type=float, default=COMBINED_SCI_THRESHOLD,
+        help="SCI floor for the 'sci_psp' rule")
+    add("--quality-only", action="store_true", help="Metrics/report only; skip TDDR/SCR/bandpass/baseline")
+    add("--plot-channels", action="store_true", help="Write a per-channel quality PDF next to each report")
+    add("--skip-plots", action="store_true", help="Skip the overview PDFs (independent of --plot-channels)")
+    add("--hard-sqi-discard", type=float, default=DEFAULT_HARD_SQI_DISCARD,
+        help="Step 4 of the Gate A chain: a Gate-A-flagged channel that passed the dead checks "
+             "is dropped if SQI <= this")
+    add("--disable-hard-sqi", action="store_true", help="Turn step 4 off (wins over --hard-sqi-discard)")
+    add("--dataset-median-cardiac-sd", type=float, default=None,
+        help="Corpus-wide median CardiacSD for Gate A. Without this and "
+             "--channel-median-cardiac-sd-file Gate A never flags anything.")
+    add("--channel-median-cardiac-sd-file", type=Path, default=None,
+        help=".json or .csv of each channel's own median CardiacSD (Channel + CardiacSD_Median columns)")
+
+
+def criterion_from_args(args: argparse.Namespace) -> ExclusionCriterion:
+    return make_criterion(
+        args.exclusion_method,
+        sqi_threshold=args.sqi_threshold,
+        sci_threshold=args.sci_threshold,
+        psp_threshold=args.psp_threshold,
+        combined_sci_threshold=args.combined_sci_threshold,
+    )
+
+
+def comparison_criteria_from_args(args: argparse.Namespace) -> List[ExclusionCriterion]:
+    """The four standard criteria at the user's thresholds, independent of --exclusion-method."""
+    return [
+        make_criterion(m, sqi_threshold=args.sqi_threshold, sci_threshold=args.sci_threshold,
+                       psp_threshold=args.psp_threshold, combined_sci_threshold=args.combined_sci_threshold)
+        for m in COMPARISON_METHODS
+    ]
+
+
+def hard_sqi_discard_from_args(args: argparse.Namespace) -> Optional[float]:
+    return None if args.disable_hard_sqi else args.hard_sqi_discard
+
+
+def channel_median_cardiac_sd_from_args(args: argparse.Namespace) -> Optional[Dict[int, float]]:
+    if args.channel_median_cardiac_sd_file is None:
+        return None
+    return load_channel_median_cardiac_sd(args.channel_median_cardiac_sd_file)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Batch-process fNIRS OD TXT files.",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("input_dir", type=Path, help="Root directory containing .txt files")
+    parser.add_argument("output_dir", type=Path, help="Directory for processed output")
+    add_pipeline_args(parser)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    batch = BatchProcessor(fs=args.fs, sci_threshold=args.sci_threshold)
+    batch = BatchProcessor(
+        fs=args.fs,
+        criterion=criterion_from_args(args),
+        quality_only=args.quality_only,
+        plot_channel_quality=args.plot_channels,
+        comparison_criteria=comparison_criteria_from_args(args),
+        skip_plots=args.skip_plots,
+        hard_sqi_discard=hard_sqi_discard_from_args(args),
+        dataset_median_cardiac_sd=args.dataset_median_cardiac_sd,
+        channel_median_cardiac_sd=channel_median_cardiac_sd_from_args(args),
+    )
     results = batch.process_batch(args.input_dir, args.output_dir)
-
-    print(f"\nBatch processing complete. Processed subjects: {len(results)}")
+    print(f"Done. Processed {sum(map(len, results.values()))} files across {len(results)} subjects.")
 
 
 if __name__ == "__main__":
