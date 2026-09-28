@@ -1,0 +1,136 @@
+"""Scalp Coupling Index (SCI), QT-NIRS style.
+
+QT-NIRS (Pollonini's own tool for the PHOEBE work) scores a channel in short,
+non-overlapping windows rather than over the whole recording: each wavelength is
+bandpass-filtered to the cardiac band, cut into windows, and the window score is the
+zero-lag correlation of the two z-scored, filtered traces in that window. A channel's
+SCI is the median across its windows. QT-NIRS's own tool defaults to 5 s windows;
+this pipeline uses WINDOW_S = 10 s.
+
+A window whose filtered signal is flat (SD ~ 0, e.g. a dead channel, or a window that
+lands entirely on a motion clamp) scores 0 rather than NaN: there's no cardiac
+component to correlate, which is exactly what "poorly coupled" means, and one flat
+window shouldn't turn the whole channel's SCI into NaN. NaN is reserved for a channel
+that can't be scored at all (non-finite input, or too short to filter).
+
+Filtering happens once over the full trace before windowing, not window-by-window: cut
+first and filter each window and every window edge (not just the recording's) picks up
+padding distortion, which is worse than the (minor) mismatch with QT-NIRS's own
+window-then-filter order.
+
+cardiac_band_sd is not a QT-NIRS metric. It's this pipeline's amplitude complement to
+SCI, added because SCI is scale-invariant and a flat, dead channel can still score
+close to 1. It reuses the same filtered windows so the SD reflects exactly what SCI
+scores, and is reported the same way: the median across windows.
+
+Pollonini, L., Olds, C., Abaya, H., Bortfeld, H., Beauchamp, M. S., & Oghalai, J. S.
+(2014). Hearing Research, 309, 84-93.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.signal import butter, sosfiltfilt
+
+CARDIAC_BAND = (0.5, 2.5)
+WINDOW_S = 10.0
+
+
+def cardiac_filter(x: np.ndarray, fs: float, band: tuple[float, float], order: int) -> np.ndarray | None:
+    """Zero-phase, demeaned bandpass over the whole trace. None if too short to filter.
+
+    SOS form, not (b, a): the transfer-function form loses accuracy as fs grows (3e-3
+    error at 200 Hz, unusable at 500 Hz) for this band.
+    """
+    low, high = band
+    if not 0 < low < high < fs / 2:
+        raise ValueError(f"Invalid cardiac band {band} for fs={fs} (Nyquist={fs / 2})")
+    sos = butter(order, band, btype="band", fs=fs, output="sos")
+    if len(x) <= 3 * (2 * len(sos) + 1):
+        return None
+    y = sosfiltfilt(sos, x)
+    return y - y.mean()
+
+
+def cardiac_windows(f1: np.ndarray, f2: np.ndarray, fs: float, window_s: float) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Cut two already-filtered traces into non-overlapping windows.
+
+    A trailing partial window is dropped. A trace shorter than one window becomes a
+    single window spanning the whole trace. Returns [] if that single window would
+    still be under 2 samples.
+    """
+    win = int(round(window_s * fs))
+    win = min(win, len(f1)) or len(f1)
+    if win < 2:
+        return []
+    return [(f1[i:i + win], f2[i:i + win]) for i in range(0, len(f1) - win + 1, win)]
+
+
+# A window counts as flat relative to its own channel's overall filtered amplitude, not
+# against a fixed absolute value: a channel that goes dead partway through (e.g. an optode
+# coming loose mid-recording) still has filtfilt's step-response ripple decaying across the
+# first window or two after the drop, which sits far above any fixed-value floor like 1e-12
+# but is still noise, not a cardiac signal -- and it can spuriously correlate across the two
+# wavelengths because both channels ring in response to the same step. Scaling the floor by
+# the channel's own amplitude catches that decay as flat while leaving a genuinely faint (but
+# real) cardiac window alone.
+_FLAT_REL_TOL = 1e-3
+
+
+def zscore_or_zero(w: np.ndarray, floor: float = 0.0) -> np.ndarray:
+    """Zero mean, unit variance; an all-zero array (not None) for a window at or below floor."""
+    sd = w.std()
+    return np.zeros_like(w) if sd <= floor else (w - w.mean()) / sd
+
+
+def _filtered_windows(od_wl1, od_wl2, fs, band, window_s, filter_order):
+    """Bandpass both traces, cut into windows, and set each channel's flatness floor.
+
+    Returns (windows, floor1, floor2), or None if non-finite, mismatched, or unusable.
+    """
+    x1 = np.asarray(od_wl1, dtype=float).ravel()
+    x2 = np.asarray(od_wl2, dtype=float).ravel()
+    if x1.shape != x2.shape:
+        raise ValueError("Inputs must be the same length")
+    if not (np.isfinite(x1).all() and np.isfinite(x2).all()):
+        return None
+    f1, f2 = cardiac_filter(x1, fs, band, filter_order), cardiac_filter(x2, fs, band, filter_order)
+    if f1 is None or f2 is None:
+        return None
+    windows = cardiac_windows(f1, f2, fs, window_s)
+    if not windows:
+        return None
+    return windows, _FLAT_REL_TOL * f1.std(), _FLAT_REL_TOL * f2.std()
+
+
+def _window_correlation(w1: np.ndarray, w2: np.ndarray, floor1: float, floor2: float) -> float:
+    n1, n2 = zscore_or_zero(w1, floor1), zscore_or_zero(w2, floor2)
+    if not n1.any() or not n2.any():
+        return 0.0
+    r = float(np.corrcoef(n1, n2)[0, 1])
+    return r if np.isfinite(r) else 0.0
+
+
+def scalp_coupling_index(od_wl1, od_wl2, fs: float,
+                         cardiac_band: tuple[float, float] = CARDIAC_BAND,
+                         window_s: float = WINDOW_S,
+                         filter_order: int = 4) -> float:
+    """Median per-window correlation, in [-1, 1] (higher is better). NaN if unscoreable."""
+    result = _filtered_windows(od_wl1, od_wl2, fs, cardiac_band, window_s, filter_order)
+    if result is None:
+        return float("nan")
+    windows, floor1, floor2 = result
+    return float(np.median([_window_correlation(w1, w2, floor1, floor2) for w1, w2 in windows]))
+
+
+def cardiac_band_sd(od_wl1, od_wl2, fs: float,
+                    cardiac_band: tuple[float, float] = CARDIAC_BAND,
+                    window_s: float = WINDOW_S,
+                    filter_order: int = 4) -> tuple[float, float]:
+    """(median SD wl1, median SD wl2) across windows, same filter as SCI. (NaN, NaN) if unusable."""
+    result = _filtered_windows(od_wl1, od_wl2, fs, cardiac_band, window_s, filter_order)
+    if result is None:
+        return float("nan"), float("nan")
+    windows, _, _ = result
+    return (float(np.median([w1.std() for w1, _ in windows])),
+            float(np.median([w2.std() for _, w2 in windows])))
