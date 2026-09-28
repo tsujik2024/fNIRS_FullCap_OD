@@ -1,215 +1,151 @@
-"""
-Implements baseline subtraction for fNIRS data, supporting:
-- A custom baseline DataFrame (user-provided), or
-- The baseline period marked by specific events, or
-- A specified sample range.
+"""Baseline subtraction for fNIRS data.
 
-Flexible handling of baseline markers (S1, S2, W1, etc.)
+baseline_subtraction() picks the window from, in order: a BaselineStart /
+BaselineEnd marker pair, the span between the first two markers, recording
+start to a lone marker, or the first 20 s. A baseline_df overrides all of that.
+The level is a 10% trimmed mean so motion spikes in the window don't skew it.
+
+find_baseline_window() is the stricter S1 -> W1 resolver used by the full-cap
+pipeline (OD referencing and the concentration-stage baseline both call it, so
+they can't drift apart).
 """
 
-import pandas as pd
-import numpy as np
 import logging
+
+import numpy as np
+import pandas as pd
+from scipy.stats import trim_mean
 
 logger = logging.getLogger(__name__)
 
+TRIM_PROPORTION = 0.10
+DEFAULT_BASELINE_S = 20.0
+BASELINE_START_SAMPLE = 4  # skip the first few samples
 
-def baseline_subtraction(
-        df: pd.DataFrame,
-        events_df: pd.DataFrame,
-        baseline_df: pd.DataFrame = None
-) -> pd.DataFrame:
+_IGNORE_COLS = ["Sample number", "Event", "Time (s)", "Condition", "Subject"]
+
+
+def find_baseline_window(events, fs, n, max_s=DEFAULT_BASELINE_S):
+    """Return (start, end) samples of the pre-task baseline, or None if `events`
+    has nothing usable. Callers pick their own fallback.
+
+    Priority: S1->W1, S1->S2, S1 + max_s, then Task*Start / Baseline*End.
+    S1 marks the START of the standing baseline in this protocol; only the
+    Task*Start / Baseline*End markers mark its end. Treating bare S1 as an end
+    marker silently references to the pre-S1 device warm-up instead (this was a
+    real bug: every file was using [4, S1)).
     """
-    Applies baseline subtraction to the given DataFrame of fNIRS signals.
+    if events is None or events.empty or "Event" not in events.columns:
+        return None
 
-    Flexible baseline detection:
-    - Looks for explicit BaselineStart/BaselineEnd markers
-    - Uses period BETWEEN first two task markers (e.g., S1 to W1, or S1 to S2)
-    - Falls back to first 20 seconds if no markers found
+    max_end = int(max_s * fs)
+    min_span = max(1, int(fs))  # need at least ~1 s
 
-    Typical usage:
-    - S1 = baseline/recording start
-    - W1/S2 = task start (end of baseline)
+    ev = events.copy()
+    ev["Event"] = ev["Event"].astype(str).str.strip()
+    ev["Sample number"] = pd.to_numeric(ev["Sample number"], errors="coerce")
+    ev = ev.dropna(subset=["Sample number"]).sort_values("Sample number")
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing fNIRS data (columns for channels), plus any metadata
-        columns like 'Sample number', 'Event', 'Time (s)' that should be ignored.
-    events_df : pd.DataFrame
-        DataFrame specifying events. Must have columns:
-          - 'Sample number'
-          - 'Event'
-    baseline_df : pd.DataFrame, optional
-        If provided, each channel's baseline mean is computed from this DataFrame
-        instead of from events in `df`. Must have the same column names as `df`.
-        Default is None.
+    def first(pattern, after=None):
+        m = ev["Event"].str.match(pattern, case=False, na=False)
+        if after is not None:
+            m &= ev["Sample number"] > after
+        return ev.loc[m, "Sample number"].iloc[0] if m.any() else None
 
-    Returns
-    -------
-    corrected_df : pd.DataFrame
-        A new DataFrame with the baseline-subtracted signals.
+    def window(a, b):
+        a, b = int(max(0, a)), int(min(b, n))
+        return (a, b) if b - a >= min_span else None
+
+    s1 = first(r"^S1$")
+    if s1 is not None:
+        for end in (first(r"^W1$", s1), first(r"^S2$", s1), s1 + max_end):
+            if end is not None and (w := window(s1, end)):
+                return w
+
+    marker = first(r"^Task.*Start$|^Baseline.*End$")
+    if marker is not None:
+        return window(BASELINE_START_SAMPLE, min(int(marker) - 1, max_end))
+    return None
+
+
+def baseline_subtraction(df: pd.DataFrame, events_df: pd.DataFrame,
+                         baseline_df: pd.DataFrame = None, fs: float = None) -> pd.DataFrame:
+    """Subtract each channel's baseline level. Metadata columns are left alone.
+
+    baseline_df: if given, levels come from it instead of from `events_df`
+    (same channel column names as `df`).
+    fs: only matters for the marker fallbacks; estimated from 'Time (s)' or
+    50 Hz if omitted.
     """
-    corrected_df = df.copy()
-
-    # Identify which columns are channels vs. metadata
-    ignore_cols = ['Sample number', 'Event', 'Time (s)', 'Condition', 'Subject']
-    data_cols = [col for col in corrected_df.columns if col not in ignore_cols]
+    out = df.copy()
+    cols = [c for c in out.columns if c not in _IGNORE_COLS]
 
     if baseline_df is not None:
-        # Use the provided baseline_df
-        logger.info("Using provided baseline DataFrame for baseline subtraction")
-        for ch in data_cols:
-            baseline_mean = baseline_df[ch].mean()
-            corrected_df[ch] = corrected_df[ch] - baseline_mean
-        return corrected_df
+        for c in cols:
+            out[c] = out[c] - trim_mean(baseline_df[c].dropna(), TRIM_PROPORTION)
+        return out
 
-    # ---------------------------------------------------
-    # Compute baseline from events_df markers
-    # ---------------------------------------------------
-    logger.info("Computing baseline from events DataFrame")
+    if fs is None:
+        fs = _estimate_fs(df)
 
-    # Clean up events DataFrame
-    events_clean = events_df.copy()
-    events_clean['Event'] = (
-        events_clean['Event']
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(r"\s+", "", regex=True)  # Remove internal spaces
-    )
-
-    # Filter out empty/nan events
-    events_clean = events_clean[
-        events_clean['Event'].str.contains(r'[A-Z0-9]', regex=True, na=False)
-    ]
-
-    # Sort by sample number
-    events_clean = events_clean.sort_values('Sample number').reset_index(drop=True)
-
-    # Log what events we found
-    logger.info(f"Found {len(events_clean)} events: {events_clean['Event'].tolist()}")
-
-    # Estimate sampling rate
-    if hasattr(df, 'fs'):
-        fs = df.fs
-    elif 'Time (s)' in df.columns and len(df['Time (s)']) > 1:
-        time_diff = df['Time (s)'].iloc[1] - df['Time (s)'].iloc[0]
-        fs = 1 / time_diff if time_diff > 0 else 50.0
-    else:
-        fs = 50.0
-
-    logger.info(f"Using sampling rate: {fs} Hz")
-
-    # Strategy 1: Look for explicit BaselineStart/BaselineEnd
-    if ('BASELINESTART' in events_clean['Event'].values and
-            'BASELINEEND' in events_clean['Event'].values):
-        start_sample = events_clean.loc[
-            events_clean['Event'] == 'BASELINESTART', 'Sample number'
-        ].values[0]
-        end_sample = events_clean.loc[
-            events_clean['Event'] == 'BASELINEEND', 'Sample number'
-        ].values[0]
-        logger.info(f"Found explicit baseline markers: samples {start_sample} to {end_sample}")
-
-    # Strategy 2: Use period between FIRST TWO markers
-    # (e.g., S1 to W1, S1 to S2, S1 to S3, etc.)
-    elif len(events_clean) >= 2:
-        # Get first two markers
-        first_marker = events_clean.iloc[0]
-        second_marker = events_clean.iloc[1]
-
-        start_sample = first_marker['Sample number']
-        end_sample = second_marker['Sample number']
-
-        baseline_duration = (end_sample - start_sample) / fs
-
-        logger.info(
-            f"Using period between first two markers as baseline:\n"
-            f"  Start: '{first_marker['Event']}' at sample {start_sample}\n"
-            f"  End: '{second_marker['Event']}' at sample {end_sample}\n"
-            f"  Duration: {baseline_duration:.1f}s"
-        )
-
-        # Validate baseline duration is reasonable (between 2s and 60s)
-        if baseline_duration < 2.0:
-            logger.warning(
-                f"Baseline period very short ({baseline_duration:.1f}s). "
-                f"Check if markers are correct."
-            )
-        elif baseline_duration > 60.0:
-            logger.warning(
-                f"Baseline period very long ({baseline_duration:.1f}s). "
-                f"Check if markers are correct. Capping at 30s."
-            )
-            # Cap at 30 seconds
-            end_sample = start_sample + int(30 * fs)
-
-    # Strategy 3: Only ONE marker found - use period from start to that marker
-    elif len(events_clean) == 1:
-        first_marker = events_clean.iloc[0]
-        start_sample = 4  # Skip initial samples
-        end_sample = first_marker['Sample number']
-
-        baseline_duration = (end_sample - start_sample) / fs
-        logger.info(
-            f"Only one marker found ('{first_marker['Event']}'). "
-            f"Using {baseline_duration:.1f}s from recording start to marker as baseline."
-        )
-
-        # Ensure reasonable duration
-        if baseline_duration < 5.0:
-            logger.warning(
-                f"Baseline too short ({baseline_duration:.1f}s). Using first 20s instead."
-            )
-            start_sample = 4
-            end_sample = int(20 * fs)
-
-    # Strategy 4: No markers found - use first 20 seconds
-    else:
-        logger.warning("No event markers found. Using first 20 seconds as baseline.")
-        start_sample = 4
-        end_sample = int(20 * fs)
-
-    # Convert to integers and validate bounds
-    start = int(start_sample)
-    end = int(end_sample)
-
-    # Ensure indices are within data bounds
-    if not (0 <= start < len(corrected_df)):
-        logger.warning(f"Start sample {start} out of bounds. Adjusting to 4.")
+    start, end = _window_from_markers(events_df, fs)
+    n = len(out)
+    if not 0 <= start < n:
+        logger.warning(f"Baseline start {start} out of bounds; using 4")
         start = 4
-
-    if not (start < end <= len(corrected_df)):
-        logger.warning(
-            f"End sample {end} out of bounds (data length={len(corrected_df)}). "
-            f"Adjusting to valid range."
-        )
-        end = min(end, len(corrected_df))
-
+    end = min(end, n)
     if start >= end:
-        logger.warning(
-            f"Invalid baseline interval: start={start} >= end={end}. "
-            "Using first 20 seconds instead."
-        )
-        start = 4
-        end = min(int(20 * fs), len(corrected_df))
+        logger.warning(f"Invalid baseline interval ({start}, {end}); using first 20 s")
+        start, end = 4, min(int(20 * fs), n)
 
-    # Apply baseline subtraction
-    baseline_duration = (end - start) / fs
-    logger.info(
-        f"✓ Applying baseline correction: {baseline_duration:.1f}s "
-        f"(samples {start} to {end})"
-    )
+    duration = (end - start) / fs
+    logger.info(f"Baseline: samples {start}-{end} ({duration:.1f}s)")
 
-    for ch in data_cols:
-        baseline_segment = corrected_df.loc[start:end - 1, ch]
-        baseline_mean = baseline_segment.mean()
-        corrected_df[ch] = corrected_df[ch] - baseline_mean
+    for c in cols:
+        seg = out[c].iloc[start:end].dropna()
+        out[c] = out[c] - (trim_mean(seg, TRIM_PROPORTION) if len(seg) else np.nan)
 
-    # Add baseline info as attributes
-    corrected_df.attrs['baseline_start'] = start
-    corrected_df.attrs['baseline_end'] = end
-    corrected_df.attrs['baseline_duration_s'] = baseline_duration
+    out.attrs.update(baseline_start=start, baseline_end=end, baseline_duration_s=duration)
+    return out
 
-    return corrected_df
+
+def _estimate_fs(df):
+    if "Time (s)" in df.columns and len(df) > 1:
+        dt = df["Time (s)"].iloc[1] - df["Time (s)"].iloc[0]
+        if dt > 0:
+            return 1 / dt
+    return 50.0
+
+
+def _window_from_markers(events_df, fs):
+    ev = events_df.copy()
+    ev["Event"] = (ev["Event"].astype(str).str.strip().str.upper()
+                   .str.replace(r"\s+", "", regex=True))
+    ev = ev[ev["Event"].str.contains(r"[A-Z0-9]", na=False)]
+    ev = ev.sort_values("Sample number").reset_index(drop=True)
+    names = ev["Event"].to_numpy()
+
+    if "BASELINESTART" in names and "BASELINEEND" in names:
+        start = ev.loc[ev["Event"] == "BASELINESTART", "Sample number"].iloc[0]
+        end = ev.loc[ev["Event"] == "BASELINEEND", "Sample number"].iloc[0]
+
+    elif len(ev) >= 2:  # e.g. S1 -> W1, S1 -> S2
+        start, end = ev["Sample number"].iloc[0], ev["Sample number"].iloc[1]
+        dur = (end - start) / fs
+        if dur < 2:
+            logger.warning(f"Baseline between first two markers is only {dur:.1f}s; check markers")
+        elif dur > 60:
+            logger.warning(f"Baseline between first two markers is {dur:.1f}s; capping at 30s")
+            end = start + int(30 * fs)
+
+    elif len(ev) == 1:  # recording start -> the one marker
+        start, end = 4, ev["Sample number"].iloc[0]
+        if (end - start) / fs < 5:
+            logger.warning("Only one marker and baseline < 5s; using first 20 s")
+            start, end = 4, int(20 * fs)
+
+    else:
+        logger.warning("No event markers; using first 20 s as baseline")
+        start, end = 4, int(20 * fs)
+
+    return int(start), int(end)
