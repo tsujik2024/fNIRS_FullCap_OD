@@ -1,0 +1,81 @@
+"""Channel-exclusion criteria.
+
+    sqi      SQI < t                 (Sappia 2020)
+    sci      SCI < t                 (Pollonini 2014)
+    psp      PSP < t                 (Pollonini 2016 / PHOEBE)
+    sci_psp  SCI < t1 OR PSP < t2    (NIRSplot)
+    none     nothing excluded        (unfiltered control)
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Callable, Mapping
+
+__all__ = [
+    "ExclusionCriterion",
+    "make_criterion",
+    "METHODS",
+    "DEFAULT_SQI_THRESHOLD",
+    "DEFAULT_SCI_THRESHOLD",
+    "DEFAULT_PSP_THRESHOLD",
+    "COMBINED_SCI_THRESHOLD",
+]
+
+METHODS: tuple[str, ...] = ("sqi", "sci", "psp", "sci_psp", "none")
+
+DEFAULT_SQI_THRESHOLD: float = 2.0    # Sappia 2020 quotes 2.5 (loose) / 3.0 (standard) on the 1-5 scale
+DEFAULT_SCI_THRESHOLD: float = 0.75   # Pollonini 2014
+DEFAULT_PSP_THRESHOLD: float = 0.1    # Pollonini 2016
+COMBINED_SCI_THRESHOLD: float = 0.75  # 0.5 gives the looser NIRSplot/QT-NIRS gate
+
+_NAMES = {"sqi": "SQI", "sci": "SCI", "psp": "PSP", "sci_psp": "SCI+PSP", "none": "none"}
+
+
+def _below(value: object, threshold: float) -> bool:
+    """Missing, non-numeric and NaN all count as failing."""
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return True
+    return math.isnan(v) or v < threshold
+
+
+@dataclass(frozen=True)
+class ExclusionCriterion:
+    method: str
+    name: str
+    description: str
+    thresholds: Mapping[str, float]
+    _predicate: Callable[[Mapping[str, float]], bool] = field(repr=False)
+
+    def excludes(self, metrics: Mapping[str, float]) -> bool:
+        return self._predicate(metrics)
+
+
+def make_criterion(
+    method: str,
+    *,
+    sqi_threshold: float = DEFAULT_SQI_THRESHOLD,
+    sci_threshold: float = DEFAULT_SCI_THRESHOLD,
+    psp_threshold: float = DEFAULT_PSP_THRESHOLD,
+    combined_sci_threshold: float = COMBINED_SCI_THRESHOLD,
+) -> ExclusionCriterion:
+    """combined_sci_threshold only affects sci_psp and is independent of sci_threshold."""
+    key = method.lower()
+    if key not in METHODS:
+        raise ValueError(f"Unknown exclusion method {method!r}; expected one of {METHODS}")
+    if key == "none":
+        return ExclusionCriterion(key, _NAMES[key], "no exclusion", {}, lambda m: False)
+
+    limits = {
+        "sqi": {"SQI": sqi_threshold},
+        "sci": {"SCI": sci_threshold},
+        "psp": {"PSP": psp_threshold},
+        "sci_psp": {"SCI": combined_sci_threshold, "PSP": psp_threshold},
+    }[key]
+    limits = {k: float(v) for k, v in limits.items()}
+    desc = " OR ".join(f"{k} < {v}" for k, v in limits.items())
+    return ExclusionCriterion(key, _NAMES[key], desc, limits,
+                              lambda m: any(_below(m.get(k), v) for k, v in limits.items()))
