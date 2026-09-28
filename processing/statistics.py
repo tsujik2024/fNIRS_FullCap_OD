@@ -1,582 +1,649 @@
-# statistics.py - UPDATED FOR DUAL-PASS PROCESSING WITH BACKWARD COMPATIBILITY
-import os
-import pandas as pd
-from typing import List, Dict, Tuple
+"""Aggregate per-file processed CSVs and quality reports into batch statistics.
+
+Heads up on reading the gate columns: process_file.py runs Flatlined /
+PartialDropout / HardSQIDiscard only on channels that already cleared SciPspPass
+and were GateAFlagged, so they're a funnel, not independent tests (HardSQIDiscard's
+"caught alone" count always equals its total). CriterionExcluded is the one
+flag independent of the chain. gate_a_funnel shows the stage-by-stage counts.
+"""
+
+from __future__ import annotations
+
 import logging
-import traceback
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
+
+from read.channel_config import CH_REGION_MAP, CH_REGION_MAP_COMBINED, CHANNEL_TO_REGION
+from channel_quality.exclusion import (
+    DEFAULT_SQI_THRESHOLD,
+    DEFAULT_SCI_THRESHOLD,
+    DEFAULT_PSP_THRESHOLD,
+    COMBINED_SCI_THRESHOLD,
+)
 
 logger = logging.getLogger(__name__)
 
-# Import your channel utils to get correct region names
-try:
-    from read.channel_utils import CH_REGION_MAP, CH_REGION_MAP_COMBINED
+OXY = "_oxy"
+DEOXY = "_deoxy"
 
-    HAS_CHANNEL_UTILS = True
-except ImportError:
-    HAS_CHANNEL_UTILS = False
-    logger.warning("Could not import channel_utils, using default region names")
+_METRIC_COLS = ("SQI", "SCI", "PSP")
+# Cardiac-band amplitude; reports from before that patch lack them and the cardiac sheets are skipped
+_CARDIAC_COLS = ("CardiacSD_WL1", "CardiacSD_WL2", "CardiacSD")
+# Precondition + step-1 flag of the chain; neither excludes anything by itself
+_CHAIN_COLS = ("SciPspPass", "GateAFlagged")
+_GATE_COLS = ("Flatlined", "PartialDropout", "HardSQIDiscard", "CriterionExcluded")
+_DIAGNOSTIC_COLS = ("PartialDropoutFraction",)
 
-original_read_csv = pd.read_csv
+# Cardiac-SD diagnostics only; these never affect channel exclusion
+_CARDIAC_SCI_THRESHOLDS = (0.50, 0.60, 0.70, 0.75, 0.80, 0.90)
+_CARDIAC_FLATLINE_RATIO = 0.05  # vs. dataset median
+_CARDIAC_LOW_SD_RATIO = 0.20    # vs. the channel's own median
+
+_CH_TO_BASE_REGION = {ch: region.split("_", 1)[0] for ch, region in CHANNEL_TO_REGION.items()}
+
+_QUALITY_SHEET_FILENAMES = {
+    "exclusion_comparison": "exclusion_comparison.csv",
+    "exclusion_by_condition": "exclusion_by_condition.csv",
+    "exclusion_by_region": "exclusion_by_region.csv",
+    "exclusion_by_gate": "exclusion_by_gate.csv",
+    "gate_a_funnel": "gate_a_funnel.csv",
+    "cardiac_sd_by_threshold": "cardiac_sd_by_sci_threshold.csv",
+    "cardiac_sd_by_channel": "cardiac_sd_by_channel.csv",
+    "cardiac_sd_flagged": "cardiac_sd_flagged_high_sci_low_sd.csv",
+    "cardiac_sd_by_retention_rule": "cardiac_sd_by_retention_rule.csv",
+}
+
+_FILENAME_SUFFIX_RE = re.compile(r"(?:_(?:filtered|unfiltered))?_(?:processed|quality_report)\.csv$")
+_RAW_EXT_RE = re.compile(r"\.(?:txt|csv|oxy4|oxyproj)$", re.I)
+_FILTERED_DIR_RE = re.compile(r"^with_.+_filtering$")
+_UNFILTERED_DIR = "no_filtering"
+_QUALITY_ONLY_DIR = "channel_quality"
+_UNKNOWN = "Unknown"
 
 
-def safe_read_csv(filepath_or_buffer, *args, **kwargs):
-    """Wrapper for pd.read_csv that rejects .txt files"""
-    if isinstance(filepath_or_buffer, str):
-        if filepath_or_buffer.endswith('.txt'):
-            error_msg = f"EMERGENCY PATCH: Blocked attempt to read .txt file: {filepath_or_buffer}"
-            logger.error(error_msg)
-            print("=" * 80)
-            traceback.print_stack()
-            print("=" * 80)
-            raise ValueError(error_msg)
-    return original_read_csv(filepath_or_buffer, *args, **kwargs)
+def _read_csv(path: Path) -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_csv(path)
+    except (OSError, pd.errors.ParserError) as e:
+        logger.warning(f"Failed to read {path}: {e}")
+        return None
 
 
-pd.read_csv = safe_read_csv
-print("EMERGENCY PATCH ACTIVE: Will block any .txt file access via pandas")
+def _is_fail(df: pd.DataFrame) -> pd.Series:
+    return df["Status"].astype(str).str.lower().eq("fail")
+
+
+def _sd_stats(sd: pd.Series, with_p95: bool = True) -> Dict[str, float]:
+    keys = ["CardiacSD_Median", "CardiacSD_P05"] + (["CardiacSD_P95"] if with_p95 else []) + ["CardiacSD_Min"]
+    if sd.empty:
+        return dict.fromkeys(keys, np.nan)
+    vals = {"CardiacSD_Median": sd.median(), "CardiacSD_P05": sd.quantile(0.05),
+            "CardiacSD_P95": sd.quantile(0.95), "CardiacSD_Min": sd.min()}
+    return {k: round(float(vals[k]), 6) for k in keys}
+
+
+def _has_cardiac(df: pd.DataFrame) -> bool:
+    return not df.empty and "SCI" in df.columns and "CardiacSD" in df.columns
 
 
 class StatisticsCalculator:
-    """
-    UPDATED: Handles dual-pass processing statistics (with and without SQI filtering).
-    Also maintains backward compatibility with existing pipeline_manager.
-    """
+    def __init__(self, input_base_dir: str | Path | None = None):
+        self.input_base_dir = Path(input_base_dir) if input_base_dir else None
 
-    def __init__(self, input_base_dir: str = ""):
+    # ---- entry points ------------------------------------------------------
+
+    def collect_dual_pass_statistics(self, output_base_dir: str | Path) -> pd.DataFrame:
+        """One row per *_processed.csv under output_base_dir. ("Dual pass" is a
+        historical name: this collects whatever filtered/unfiltered runs exist.)
         """
-        Initialize the statistics calculator.
+        filtered, unfiltered = self._find_processed_files(Path(output_base_dir))
+        logger.info(f"Found {len(filtered)} filtered and {len(unfiltered)} unfiltered processed CSVs")
 
-        Args:
-            input_base_dir: Base directory for input files
-        """
-        self.input_base_dir = input_base_dir
-
-        # Get actual region names from channel_utils if available
-        if HAS_CHANNEL_UTILS:
-            # Get hemisphere-specific regions from CH_REGION_MAP
-            self.required_regions = list(CH_REGION_MAP.keys())  # PFC_R, PFC_L, SMA_L, etc.
-            self.combined_regions = list(CH_REGION_MAP_COMBINED.keys())  # PFC, SMA, M1, etc.
-            logger.info(f"Using regions from channel_utils: {self.required_regions}")
-            logger.info(f"Combined regions: {self.combined_regions}")
-        else:
-            # Fallback to original list
-            self.required_regions = ['pfc', 'sma', 'm1', 's1', 'v1']
-            self.combined_regions = ['PFC', 'SMA', 'M1', 'S1', 'V1']
-            logger.warning("Using default region names (channel_utils not available)")
-
-    def calculate_subject_y_limits(self, subject_data: pd.DataFrame) -> Tuple[float, float]:
-        """Calculate y-axis limits for plotting"""
-        try:
-            # Select only hemoglobin columns
-            signal_cols = [col for col in subject_data.columns
-                           if 'HbO' in col or 'HHb' in col or 'oxy' in col or 'deoxy' in col]
-
-            if not signal_cols:
-                return (-1, 1)
-
-            # Convert to numeric and drop NA
-            numeric_data = subject_data[signal_cols].apply(pd.to_numeric, errors='coerce')
-            numeric_data = numeric_data.dropna()
-
-            if numeric_data.empty:
-                return (-1, 1)
-
-            # Calculate max absolute value with buffer
-            max_abs = max(abs(numeric_data.max().max()),
-                          abs(numeric_data.min().min()))
-            buffer = max_abs * 0.2
-            return (-max_abs - buffer, max_abs + buffer)
-
-        except Exception as e:
-            logger.error(f"Error calculating y-limits: {str(e)}")
-            return (-1, 1)
-
-    # =========================================================================
-    # MAIN NEW METHOD FOR DUAL-PASS PROCESSING
-    # =========================================================================
-    def collect_dual_pass_statistics(self, output_base_dir: str) -> pd.DataFrame:
-        """
-        NEW METHOD: Collect statistics for BOTH SQI-filtered and non-filtered data.
-
-        This function traverses the output directory structure created by the dual-pass processor
-        and generates comprehensive statistics for both passes.
-
-        Args:
-            output_base_dir: Base output directory containing 'with_SQI_filtering'
-                            and 'no_SQI_filtering' subdirectories
-
-        Returns:
-            DataFrame with statistics for both processing passes
-        """
-        logger.info("=== COLLECTING DUAL-PASS STATISTICS ===")
-        logger.info(f"Searching in: {output_base_dir}")
-
-        # STEP 1: Find all processed CSV files in both SQI and no-SQI folders
-        sqi_files = []
-        no_sqi_files = []
-
-        # Walk through the output directory structure
-        for root, dirs, files in os.walk(output_base_dir):
-            for file in files:
-                if file.endswith('_processed.csv'):
-                    full_path = os.path.join(root, file)
-
-                    # Check if this is SQI-filtered or no-SQI
-                    if 'with_SQI_filtering' in full_path or '_SQI_processed' in file:
-                        sqi_files.append(full_path)
-                        logger.debug(f"Found SQI file: {os.path.relpath(full_path, output_base_dir)}")
-                    elif 'no_SQI_filtering' in full_path or '_NoSQI_processed' in file:
-                        no_sqi_files.append(full_path)
-                        logger.debug(f"Found no-SQI file: {os.path.relpath(full_path, output_base_dir)}")
-                    else:
-                        logger.warning(f"Could not determine processing type for: {full_path}")
-
-        logger.info(f"Found {len(sqi_files)} SQI-filtered files")
-        logger.info(f"Found {len(no_sqi_files)} non-SQI-filtered files")
-
-        if not sqi_files and not no_sqi_files:
-            logger.error("No processed CSV files found!")
+        rows = [self._summarize_file(p, True) for p in filtered]
+        rows += [self._summarize_file(p, False) for p in unfiltered]
+        rows = [r for r in rows if r]
+        if not rows:
+            logger.warning("No statistics generated")
             return pd.DataFrame()
+        return pd.DataFrame(rows)
 
-        # STEP 2: Process SQI-filtered files
-        sqi_stats = []
-        if sqi_files:
-            logger.info("Processing SQI-filtered files...")
-            for csv_file in sqi_files:
-                stats = self._process_single_csv_file(csv_file, sqi_filtered=True)
-                if stats:
-                    sqi_stats.append(stats)
+    def collect_quality_summary(
+        self,
+        output_base_dir: str | Path,
+        sqi_threshold: float = DEFAULT_SQI_THRESHOLD,
+        sci_threshold: float = DEFAULT_SCI_THRESHOLD,
+        psp_threshold: float = DEFAULT_PSP_THRESHOLD,
+        combined_sci_threshold: float = COMBINED_SCI_THRESHOLD,
+    ) -> Dict[str, pd.DataFrame]:
+        """Aggregate per-file quality reports into summary tables.
 
-        # STEP 3: Process non-SQI-filtered files
-        no_sqi_stats = []
-        if no_sqi_files:
-            logger.info("Processing non-SQI-filtered files...")
-            for csv_file in no_sqi_files:
-                stats = self._process_single_csv_file(csv_file, sqi_filtered=False)
-                if stats:
-                    no_sqi_stats.append(stats)
+        Reports are found under with_<method>_filtering/, no_filtering/ or
+        channel_quality/; if a recording appears in several, filtered wins.
 
-        # STEP 4: Combine all statistics
-        all_stats = sqi_stats + no_sqi_stats
+        The thresholds only drive the cross-method comparison sheets. They do NOT
+        change which channels were excluded at processing time.
 
-        if not all_stats:
-            logger.warning("No statistics were generated")
-            return pd.DataFrame()
-
-        result_df = pd.DataFrame(all_stats)
-        logger.info(f"Generated statistics for {len(result_df)} files")
-        logger.info(f"SQI-filtered: {len(sqi_stats)}, Non-SQI-filtered: {len(no_sqi_stats)}")
-
-        return result_df
-
-    # =========================================================================
-    # BACKWARD COMPATIBILITY METHODS
-    # =========================================================================
-    def collect_statistics_from_processed_files(self, processed_files: List[str]) -> pd.DataFrame:
+        Keys: long, per_channel, per_subject, exclusion_comparison,
+        exclusion_by_condition, exclusion_by_region, plus (when the columns exist)
+        exclusion_by_gate, gate_a_funnel, and four cardiac_sd_* sheets. Cardiac
+        amplitude uses the livelier wavelength (max of WL1/WL2), so a channel is
+        dead only when BOTH are flat. cardiac_sd_by_channel is the file to pass to
+        --channel-median-cardiac-sd-file on the next run.
         """
-        ORIGINAL METHOD: For backward compatibility with pipeline_manager.
-        Now enhanced to handle dual-pass files.
-        """
-        logger.info("Using backward-compatible method: collect_statistics_from_processed_files")
+        root = Path(output_base_dir)
+        reports = self._find_quality_reports(root)
+        if not reports:
+            logger.warning(f"No quality reports found under {root}")
+            return {}
 
-        # Check if we received .txt files (old bug) or actual CSV files
-        txt_files = [f for f in processed_files if f.endswith('.txt')]
-
-        if txt_files:
-            logger.error(f"ERROR: Received {len(txt_files)} .txt files!")
-            logger.error("This indicates a bug in the calling code.")
-
-            # Try to find CSV files independently
-            csv_files = self._find_processed_csv_files()
-            if csv_files:
-                logger.info(f"Found {len(csv_files)} CSV files instead")
-                return self._process_file_list(csv_files)
-            else:
-                logger.error("No CSV files found")
-                return pd.DataFrame()
-
-        # Process the list of files
-        return self._process_file_list(processed_files)
-
-    def collect_statistics(self, processed_files: List[str], output_base_dir: str) -> pd.DataFrame:
-        """
-        [Deprecated] Original method - now uses new dual-pass method
-        """
-        logger.warning("DEPRECATED collect_statistics method called - switching to dual-pass collection")
-        return self.collect_dual_pass_statistics(output_base_dir)
-
-    # =========================================================================
-    # PRIVATE HELPER METHODS
-    # =========================================================================
-    def _process_file_list(self, file_list: List[str]) -> pd.DataFrame:
-        """Process a list of CSV files (handles both SQI and non-SQI)"""
-        all_stats = []
-
-        for csv_file in file_list:
-            if not csv_file.endswith('.csv') or not os.path.exists(csv_file):
-                logger.warning(f"Skipping invalid file: {csv_file}")
+        chunks = []
+        for path in reports:
+            df = self._read_quality_report(path)
+            if df is None:
                 continue
+            for k, v in self._extract_metadata(path).items():
+                df[k] = v
+            chunks.append(df)
+        if not chunks:
+            return {}
 
-            # Determine if this file is SQI-filtered or not
-            if '_SQI_processed' in csv_file or 'with_SQI_filtering' in csv_file:
-                sqi_filtered = True
-            elif '_NoSQI_processed' in csv_file or 'no_SQI_filtering' in csv_file:
-                sqi_filtered = False
-            else:
-                # Can't determine - default to assuming it's SQI-filtered
-                # (this handles old single-pass files)
-                sqi_filtered = True
-                logger.warning(f"Could not determine SQI status for {csv_file}, assuming SQI-filtered")
+        long_df = pd.concat(chunks, ignore_index=True)
+        if "Channel" in long_df.columns:
+            long_df["Region"] = long_df["Channel"].map(_CH_TO_BASE_REGION).fillna(_UNKNOWN)
+        if {"CardiacSD_WL1", "CardiacSD_WL2"}.issubset(long_df.columns):
+            long_df["CardiacSD"] = long_df[["CardiacSD_WL1", "CardiacSD_WL2"]].max(axis=1)
 
-            stats = self._process_single_csv_file(csv_file, sqi_filtered)
-            if stats:
-                all_stats.append(stats)
+        ordered = (["Subject", "Timepoint", "Condition", "Region", "SourceFile", "Channel"]
+                   + list(_METRIC_COLS) + list(_CARDIAC_COLS) + list(_CHAIN_COLS) + list(_GATE_COLS)
+                   + list(_DIAGNOSTIC_COLS) + ["Status", "Excluded", "Method", "Criterion"])
+        long_df = long_df[[c for c in ordered if c in long_df.columns]]
 
-        if not all_stats:
-            logger.warning("No statistics were generated from file list")
-            return pd.DataFrame()
+        thresholds = {
+            "sqi_threshold": sqi_threshold,
+            "sci_threshold": sci_threshold,
+            "psp_threshold": psp_threshold,
+            "combined_sci_threshold": combined_sci_threshold,
+        }
+        result = {
+            "long": long_df,
+            "per_channel": self._per_channel_quality_summary(long_df),
+            "per_subject": self._per_subject_quality_summary(long_df),
+            "exclusion_comparison": self._exclusion_comparison(long_df, **thresholds),
+            "exclusion_by_condition": self._exclusion_by_group(long_df, "Condition", thresholds),
+            "exclusion_by_region": self._exclusion_by_group(long_df, "Region", thresholds),
+        }
+        if any(c in long_df.columns for c in _GATE_COLS):
+            result["exclusion_by_gate"] = self._exclusion_by_gate(long_df)
+        if any(c in long_df.columns for c in _CHAIN_COLS):
+            result["gate_a_funnel"] = self._gate_a_funnel(long_df)
+        if "CardiacSD" in long_df.columns:
+            cardiac_thresholds = sorted(set(_CARDIAC_SCI_THRESHOLDS) | {sci_threshold})
+            result.update({
+                "cardiac_sd_by_threshold": self._cardiac_sd_by_sci_threshold(long_df, cardiac_thresholds),
+                "cardiac_sd_by_channel": self._cardiac_sd_by_channel(long_df, sci_threshold),
+                "cardiac_sd_flagged": self._cardiac_sd_flagged(long_df, sci_threshold),
+                "cardiac_sd_by_retention_rule": self._cardiac_sd_by_retention_rule(
+                    long_df, sci_threshold, psp_threshold, combined_sci_threshold),
+            })
+        return result
 
-        result_df = pd.DataFrame(all_stats)
-        logger.info(f"Generated statistics for {len(result_df)} files from file list")
-        return result_df
+    # ---- writers -----------------------------------------------------------
 
-    def _process_single_csv_file(self, csv_file: str, sqi_filtered: bool) -> Dict:
-        """
-        Process a single CSV file and extract statistics.
-
-        Args:
-            csv_file: Path to the CSV file
-            sqi_filtered: Whether this file contains SQI-filtered data
-
-        Returns:
-            Dictionary of statistics or None if processing failed
-        """
-        try:
-            logger.info(f"Processing: {os.path.basename(csv_file)}")
-
-            # Read CSV file
-            df = pd.read_csv(csv_file)
-            if df.empty:
-                logger.warning(f"Empty CSV file: {csv_file}")
-                return None
-
-            # Extract metadata
-            filename = os.path.basename(csv_file)
-            subject_id = self._extract_subject_id(filename)
-            visit = self._extract_visit_from_path(csv_file)
-            condition = self._extract_condition(filename)
-
-            # Calculate statistics
-            total_samples = len(df)
-            half = total_samples // 2
-
-            stats = {
-                'Subject': subject_id,
-                'Timepoint': visit,
-                'Condition': condition,
-                'SQI_Filtered': 'Yes' if sqi_filtered else 'No',
-                'SourceFile': filename,
-                'TotalSamples': total_samples
-            }
-
-            # Log what columns we have for debugging
-            logger.debug(f"File columns: {df.columns.tolist()[:20]}...")
-
-            # Grand averages
-            grand_stats = self._calculate_grand_stats(df, half)
-            stats.update(grand_stats)
-
-            # Regional averages - now using actual region detection
-            regional_stats = self._calculate_regional_stats(df, half)
-            stats.update(regional_stats)
-
-            logger.info(f"Successfully processed: {filename} (SQI: {sqi_filtered})")
-            return stats
-
-        except Exception as e:
-            logger.error(f"Error processing {csv_file}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return None
-
-    def _find_processed_csv_files(self) -> List[str]:
-        """Find processed CSV files independently (legacy method)"""
-        search_dirs = []
-
-        if self.input_base_dir:
-            parent_dir = os.path.dirname(self.input_base_dir)
-            search_dirs.extend([
-                os.path.join(parent_dir, 'output'),
-                os.path.join(parent_dir, 'results'),
-                os.path.join(parent_dir, 'processed'),
-                os.path.join(parent_dir, 'auttest'),
-                '/Users/tsujik/Documents/auttest'
-            ])
-
-        # Remove non-existent directories
-        search_dirs = [d for d in search_dirs if os.path.exists(d)]
-
-        # Find all processed CSV files
-        csv_files = []
-        for search_dir in search_dirs:
-            for root, dirs, files in os.walk(search_dir):
-                for file in files:
-                    if file.endswith("_processed.csv") and "bad_SCI" not in file:
-                        csv_files.append(os.path.join(root, file))
-
-        return list(set(csv_files))
-
-    def _extract_subject_id(self, filename: str) -> str:
-        """Extract subject ID from filename"""
-        # Handle both naming conventions: with and without SQI suffix
-        clean_name = filename.replace('_SQI_processed.csv', '').replace('_NoSQI_processed.csv', '')
-        parts = clean_name.split('_')
-
-        # Try to extract subject pattern (e.g., "Subject1_Visit1")
-        if len(parts) >= 2:
-            # Look for pattern like "Subject1" followed by "Visit1"
-            if any(substr.lower().startswith('subject') for substr in parts):
-                # Find subject and visit parts
-                for i, part in enumerate(parts):
-                    if part.lower().startswith('subject'):
-                        if i + 1 < len(parts):
-                            return f"{part}_{parts[i + 1]}"
-                        else:
-                            return part
-                return f"{parts[0]}_{parts[1]}"
-        return "Unknown"
-
-    def _extract_visit_from_path(self, file_path: str) -> str:
-        """Extract visit from file path"""
-        parts = file_path.split(os.sep)
-        for part in parts:
-            if part.startswith('Visit'):
-                return part
-        return "Unknown"
-
-    def _extract_condition(self, filename: str) -> str:
-        """Extract condition from filename"""
-        # Remove SQI suffix first
-        clean_name = filename.replace('_SQI_processed.csv', '').replace('_NoSQI_processed.csv', '')
-        clean_name = clean_name.replace('_processed.csv', '')
-
-        # Convert to lowercase for matching
-        filename_lower = clean_name.lower()
-
-        if 'cue_walking' in filename_lower or 'cue walking' in filename_lower:
-            if 'dt3' in filename_lower or 'dt' in filename_lower:
-                return 'LongWalk_DT'
-            elif 'st' in filename_lower:
-                return 'LongWalk_ST'
-            else:
-                return 'Cue_Walking'
-        elif 'walking_st' in filename_lower or 'walkingst' in filename_lower:
-            return 'LongWalk_ST'
-        elif 'walking_dt' in filename_lower or 'walkingdt' in filename_lower:
-            return 'LongWalk_DT'
-        elif 'sitting' in filename_lower:
-            return 'Sitting'
-        elif 'standing' in filename_lower:
-            return 'Standing'
-        else:
-            # Try to extract from filename pattern
-            parts = clean_name.split('_')
-            for part in parts:
-                if part.lower() in ['st', 'dt', 'dt3']:
-                    return f'LongWalk_{part.upper()}'
-            return 'Unknown'
-
-    def _calculate_grand_stats(self, df: pd.DataFrame, half: int) -> Dict:
-        """Calculate grand statistics"""
-        stats = {}
-
-        # Look for grand mean columns
-        grand_cols = [col for col in df.columns if 'grand_' in col.lower()]
-        logger.debug(f"Found grand columns: {grand_cols}")
-
-        for col in grand_cols:
-            if 'oxy' in col.lower() or 'hbo' in col.lower():
-                try:
-                    stats[f'Grand Oxy Overall Mean'] = df[col].mean()
-                    stats[f'Grand Oxy First Half Mean'] = df[col].iloc[:half].mean()
-                    stats[f'Grand Oxy Second Half Mean'] = df[col].iloc[half:].mean()
-                except Exception as e:
-                    logger.warning(f"Error calculating grand oxy stats from {col}: {e}")
-            elif 'deoxy' in col.lower() or 'hhb' in col.lower():
-                try:
-                    stats[f'Grand Deoxy Overall Mean'] = df[col].mean()
-                    stats[f'Grand Deoxy First Half Mean'] = df[col].iloc[:half].mean()
-                    stats[f'Grand Deoxy Second Half Mean'] = df[col].iloc[half:].mean()
-                except Exception as e:
-                    logger.warning(f"Error calculating grand deoxy stats from {col}: {e}")
-
-        return stats
-
-    def _calculate_regional_stats(self, df: pd.DataFrame, half: int) -> Dict:
-        """Calculate regional statistics"""
-        stats = {}
-
-        # Get all columns that might be region columns
-        all_cols = df.columns.tolist()
-
-        # Look for oxy/deoxy columns that aren't channel columns
-        region_columns = []
-        for col in all_cols:
-            # Skip channel columns (start with CH) and grand columns
-            if col.startswith('CH') or 'grand' in col.lower() or col in ['Sample number', 'Event']:
-                continue
-
-            # Look for oxy or deoxy indicators
-            if '_oxy' in col or '_deoxy' in col or ' HbO' in col or ' HHb' in col:
-                region_columns.append(col)
-
-        logger.debug(f"Found {len(region_columns)} potential region columns")
-
-        # Group by region name
-        region_data = {}
-        for col in region_columns:
-            # Extract region name
-            region_name = None
-
-            # Try different patterns
-            if '_oxy' in col:
-                region_name = col.replace('_oxy', '')
-            elif '_deoxy' in col:
-                region_name = col.replace('_deoxy', '')
-            elif ' HbO' in col:
-                region_name = col.replace(' HbO', '')
-            elif ' HHb' in col:
-                region_name = col.replace(' HHb', '')
-
-            if region_name:
-                # Clean up region name (remove trailing underscores, etc.)
-                region_name = region_name.strip('_')
-
-                if region_name not in region_data:
-                    region_data[region_name] = {'oxy': [], 'deoxy': []}
-
-                if '_oxy' in col or ' HbO' in col:
-                    region_data[region_name]['oxy'].append(col)
-                elif '_deoxy' in col or ' HHb' in col:
-                    region_data[region_name]['deoxy'].append(col)
-
-        logger.debug(f"Organized into {len(region_data)} regions")
-
-        # Calculate statistics for each region
-        for region_name, columns in region_data.items():
-            region_key = region_name.upper()
-
-            # Oxy statistics
-            if columns['oxy']:
-                # If multiple oxy columns, average them
-                if len(columns['oxy']) == 1:
-                    oxy_col = columns['oxy'][0]
-                    oxy_data = df[oxy_col]
-                else:
-                    # Average multiple oxy columns for this region
-                    oxy_data = df[columns['oxy']].mean(axis=1)
-
-                try:
-                    stats[f'{region_key} Oxy Overall Mean'] = oxy_data.mean()
-                    stats[f'{region_key} Oxy First Half Mean'] = oxy_data.iloc[:half].mean()
-                    stats[f'{region_key} Oxy Second Half Mean'] = oxy_data.iloc[half:].mean()
-                except Exception as e:
-                    logger.warning(f"Error calculating {region_key} oxy stats: {e}")
-
-            # Deoxy statistics
-            if columns['deoxy']:
-                # If multiple deoxy columns, average them
-                if len(columns['deoxy']) == 1:
-                    deoxy_col = columns['deoxy'][0]
-                    deoxy_data = df[deoxy_col]
-                else:
-                    # Average multiple deoxy columns for this region
-                    deoxy_data = df[columns['deoxy']].mean(axis=1)
-
-                try:
-                    stats[f'{region_key} Deoxy Overall Mean'] = deoxy_data.mean()
-                    stats[f'{region_key} Deoxy First Half Mean'] = deoxy_data.iloc[:half].mean()
-                    stats[f'{region_key} Deoxy Second Half Mean'] = deoxy_data.iloc[half:].mean()
-                except Exception as e:
-                    logger.warning(f"Error calculating {region_key} deoxy stats: {e}")
-
-        # Also try to find combined regions (PFC, SMA, M1, etc.)
-        for combined_region in self.combined_regions:
-            # Look for columns that match this combined region
-            oxy_cols = [col for col in region_columns if combined_region.upper() in col.upper()
-                        and ('_oxy' in col or ' HbO' in col)]
-            deoxy_cols = [col for col in region_columns if combined_region.upper() in col.upper()
-                          and ('_deoxy' in col or ' HHb' in col)]
-
-            if oxy_cols:
-                oxy_data = df[oxy_cols].mean(axis=1)
-                stats[f'{combined_region}_COMBINED Oxy Overall Mean'] = oxy_data.mean()
-                stats[f'{combined_region}_COMBINED Oxy First Half Mean'] = oxy_data.iloc[:half].mean()
-                stats[f'{combined_region}_COMBINED Oxy Second Half Mean'] = oxy_data.iloc[half:].mean()
-
-            if deoxy_cols:
-                deoxy_data = df[deoxy_cols].mean(axis=1)
-                stats[f'{combined_region}_COMBINED Deoxy Overall Mean'] = deoxy_data.mean()
-                stats[f'{combined_region}_COMBINED Deoxy First Half Mean'] = deoxy_data.iloc[:half].mean()
-                stats[f'{combined_region}_COMBINED Deoxy Second Half Mean'] = deoxy_data.iloc[half:].mean()
-
-        return stats
-
-    def create_summary_sheets(self, stats_df: pd.DataFrame, output_folder: str) -> None:
-        """
-        Generate summary CSV files for different conditions and SQI filtering status.
-        No individual region sheets - all regions are in the main stats sheet.
-        """
+    def write_summary_sheets(self, stats_df: pd.DataFrame, output_folder: str | Path,
+                             group_by: str = "Condition") -> None:
+        """group_by: "Condition" (legacy summary_<condition>.csv), "Timepoint", or "both"."""
         if stats_df.empty:
-            logger.warning("No statistics to summarize")
+            logger.warning("No statistics to write")
             return
 
-        try:
-            os.makedirs(output_folder, exist_ok=True)
+        out = Path(output_folder)
+        out.mkdir(parents=True, exist_ok=True)
 
-            # Define output columns
-            basic_cols = ['Subject', 'Timepoint', 'Condition', 'SQI_Filtered', 'SourceFile', 'TotalSamples']
+        meta = [c for c in ("Subject", "Timepoint", "Condition", "Filtered", "SourceFile", "TotalSamples")
+                if c in stats_df.columns]
+        cols = meta + sorted(c for c in stats_df.columns if "Mean" in c)
 
-            # Find available columns
-            available_cols = list(stats_df.columns)
-            output_cols = [col for col in basic_cols if col in available_cols]
+        stats_df[cols].to_csv(out / "all_subjects_statistics.csv", index=False)
+        if "Filtered" in stats_df.columns:
+            for value, name in (("Yes", "filtered_statistics.csv"), ("No", "unfiltered_statistics.csv")):
+                subset = stats_df[stats_df["Filtered"] == value]
+                if not subset.empty:
+                    subset[cols].to_csv(out / name, index=False)
 
-            # Add statistical columns
-            stat_cols = [col for col in available_cols if 'Mean' in col]
-            output_cols.extend(sorted(stat_cols))
+        self._write_grouped_summaries(stats_df, out, cols, group_by)
+        logger.info(f"Wrote summary sheets to {out}")
 
-            # Save full statistics
-            full_stats_path = os.path.join(output_folder, 'all_subjects_statistics.csv')
-            stats_df[output_cols].to_csv(full_stats_path, index=False)
-            logger.info(f"Saved full statistics: {full_stats_path}")
+    @staticmethod
+    def _write_grouped_summaries(stats_df: pd.DataFrame, out: Path, cols: List[str], group_by: str) -> None:
+        """Condition -> summary_<cond>.csv; Timepoint -> summary_<tp>.csv; both -> summary_<tp>_<cond>.csv."""
+        mode = (group_by or "Condition").strip().lower()
+        if mode not in {"condition", "timepoint", "both"}:
+            logger.warning(f"Unknown group_by={group_by!r}; using 'Condition'")
+            mode = "condition"
 
-            # Save SQI-filtered vs non-filtered comparisons
-            if 'SQI_Filtered' in stats_df.columns:
-                # SQI-filtered only
-                sqi_df = stats_df[stats_df['SQI_Filtered'] == 'Yes']
-                if not sqi_df.empty:
-                    sqi_path = os.path.join(output_folder, 'SQI_filtered_statistics.csv')
-                    sqi_df[output_cols].to_csv(sqi_path, index=False)
-                    logger.info(f"Saved SQI-filtered statistics: {sqi_path}")
+        keys = {"condition": ["Condition"], "timepoint": ["Timepoint"], "both": ["Timepoint", "Condition"]}[mode]
+        missing = [k for k in keys if k not in stats_df.columns]
+        if missing:
+            logger.warning(f"Can't group by {keys}: missing {missing}; skipping per-group sheets")
+            return
 
-                # Non-SQI-filtered only
-                no_sqi_df = stats_df[stats_df['SQI_Filtered'] == 'No']
-                if not no_sqi_df.empty:
-                    no_sqi_path = os.path.join(output_folder, 'non_SQI_filtered_statistics.csv')
-                    no_sqi_df[output_cols].to_csv(no_sqi_path, index=False)
-                    logger.info(f"Saved non-SQI-filtered statistics: {no_sqi_path}")
+        for key, subset in stats_df.dropna(subset=keys).groupby(keys, dropna=True):
+            label = str(key) if len(keys) == 1 else "_".join(str(v) for v in key)
+            subset[cols].to_csv(out / f"summary_{label}.csv", index=False)
 
-            # Save condition-specific summaries
-            if 'Condition' in stats_df.columns:
-                for condition in stats_df['Condition'].unique():
-                    if pd.notna(condition):
-                        cond_df = stats_df[stats_df['Condition'] == condition]
-                        summary_path = os.path.join(output_folder, f'summary_{condition}.csv')
-                        cond_df[output_cols].to_csv(summary_path, index=False)
-                        logger.info(f"Saved condition summary: {summary_path}")
+    def write_quality_sheets(self, quality_summary: Dict[str, pd.DataFrame], output_folder: str | Path) -> None:
+        if not quality_summary:
+            return
+        out = Path(output_folder)
+        out.mkdir(parents=True, exist_ok=True)
+        for name, df in quality_summary.items():
+            if df is None or df.empty:
+                continue
+            path = out / _QUALITY_SHEET_FILENAMES.get(name, f"quality_{name}.csv")
+            df.to_csv(path, index=False)
+            logger.info(f"Wrote {name} ({len(df)} rows) to {path}")
 
-            logger.info(f"Statistics columns: {output_cols}")
+    # ---- file discovery ----------------------------------------------------
 
-        except Exception as e:
-            logger.error(f"Error creating summary sheets: {str(e)}")
-            logger.error(traceback.format_exc())
+    @staticmethod
+    def _find_processed_files(root: Path) -> Tuple[List[Path], List[Path]]:
+        filtered, unfiltered = [], []
+        for path in sorted(root.rglob("*_processed.csv")):
+            if any(_FILTERED_DIR_RE.match(p) for p in path.parts):
+                filtered.append(path)
+            elif _UNFILTERED_DIR in path.parts:
+                unfiltered.append(path)
+            else:
+                logger.warning(f"Can't classify {path} (no pipeline subdirectory); skipping")
+        return filtered, unfiltered
+
+    @staticmethod
+    def _find_quality_reports(root: Path) -> List[Path]:
+        """One report per recording (key: recording dir + source stem).
+        Priority when several exist: filtered > quality-only > unfiltered.
+        """
+        chosen: Dict[Tuple[str, str], Tuple[int, Path]] = {}
+        for p in sorted(root.rglob("*_quality_report.csv")):
+            if any(_FILTERED_DIR_RE.match(part) for part in p.parts):
+                priority = 0
+            elif _QUALITY_ONLY_DIR in p.parts:
+                priority = 1
+            elif _UNFILTERED_DIR in p.parts:
+                priority = 2
+            else:
+                continue
+            key = (str(p.parent.parent), _FILENAME_SUFFIX_RE.sub("", p.name))
+            if key not in chosen or chosen[key][0] > priority:
+                chosen[key] = (priority, p)
+        return sorted(p for _, p in chosen.values())
+
+    # ---- per-file stats ----------------------------------------------------
+
+    def _summarize_file(self, path: Path, filtered: bool) -> Optional[Dict]:
+        df = _read_csv(path)
+        if df is None:
+            return None
+        if df.empty:
+            logger.warning(f"Empty CSV: {path}")
+            return None
+
+        meta = self._extract_metadata(path)
+        meta["Filtered"] = "Yes" if filtered else "No"
+        meta["TotalSamples"] = len(df)
+
+        half = len(df) // 2
+        return {**meta, **self._grand_stats(df, half), **self._region_stats(df, half)}
+
+    @staticmethod
+    def _means(s: pd.Series, half: int, label: str) -> Dict[str, float]:
+        return {f"{label} Overall Mean": s.mean(),
+                f"{label} First Half Mean": s.iloc[:half].mean(),
+                f"{label} Second Half Mean": s.iloc[half:].mean()}
+
+    @classmethod
+    def _grand_stats(cls, df: pd.DataFrame, half: int) -> Dict[str, float]:
+        # process_file.py no longer writes grand_oxy/grand_deoxy, so this comes back empty for its output
+        out: Dict[str, float] = {}
+        for kind, col in (("Oxy", "grand_oxy"), ("Deoxy", "grand_deoxy")):
+            if col in df.columns:
+                out.update(cls._means(df[col], half, f"Grand {kind}"))
+        return out
+
+    @classmethod
+    def _region_stats(cls, df: pd.DataFrame, half: int) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for region in list(CH_REGION_MAP) + list(CH_REGION_MAP_COMBINED):
+            for kind, sfx in (("Oxy", OXY), ("Deoxy", DEOXY)):
+                if f"{region}{sfx}" in df.columns:
+                    out.update(cls._means(df[f"{region}{sfx}"], half, f"{region} {kind}"))
+        return out
+
+    # ---- quality-report aggregation ----------------------------------------
+
+    @staticmethod
+    def _read_quality_report(path: Path) -> Optional[pd.DataFrame]:
+        df = _read_csv(path)
+        if df is None:
+            return None
+        df["Channel"] = pd.to_numeric(df["Channel"], errors="coerce").astype("Int64")
+        for col in (*_METRIC_COLS, *_CARDIAC_COLS, *_DIAGNOSTIC_COLS):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # process_file's SUMMARY row (int counts) makes pandas write these flags as 1/0, not True/False
+        for col in (*_CHAIN_COLS, *_GATE_COLS):
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.lower().isin(("true", "1", "1.0"))
+        return df.dropna(subset=["Channel"])  # drops the SUMMARY row
+
+    @staticmethod
+    def _per_channel_quality_summary(long_df: pd.DataFrame) -> pd.DataFrame:
+        metrics = [c for c in _METRIC_COLS if c in long_df.columns]
+        grouped = long_df.groupby("Channel")
+        agg = grouped[metrics].agg(["mean", "median", "min", "max"])
+        agg.columns = [f"{m}_{stat}" for m, stat in agg.columns]
+        agg["n_observations"] = grouped.size()
+        if "Status" in long_df.columns:
+            failed = long_df.assign(_fail=_is_fail(long_df)).groupby("Channel")["_fail"].mean()
+            agg["pct_failed_active_criterion"] = failed.mul(100).round(2)
+        return agg.reset_index()
+
+    @staticmethod
+    def _per_subject_quality_summary(long_df: pd.DataFrame) -> pd.DataFrame:
+        metrics = [c for c in _METRIC_COLS if c in long_df.columns]
+        grouped = long_df.groupby("Subject")
+        agg = grouped[metrics].agg(["mean", "median"])
+        agg.columns = [f"{m}_{stat}" for m, stat in agg.columns]
+        agg["n_files"] = grouped["SourceFile"].nunique() if "SourceFile" in long_df.columns else grouped.size()
+        agg["n_channel_observations"] = grouped.size()
+        if "Status" in long_df.columns:
+            failed = long_df.assign(_fail=_is_fail(long_df)).groupby("Subject")["_fail"].sum()
+            agg["n_failed_active_criterion"] = failed.astype(int)
+            agg["pct_failed_active_criterion"] = (
+                agg["n_failed_active_criterion"] / agg["n_channel_observations"] * 100).round(2)
+        return agg.reset_index().sort_values("Subject")
+
+    @staticmethod
+    def _exclusion_comparison(long_df: pd.DataFrame, sqi_threshold: float, sci_threshold: float,
+                              psp_threshold: float, combined_sci_threshold: float) -> pd.DataFrame:
+        """Exclusion rate per literature criterion, re-evaluated on the raw metrics regardless of what
+        actually ran at processing time (that's Status/Excluded; see exclusion_by_gate and
+        gate_a_funnel). NaN counts as fail. Counts are (file, channel) observations.
+        """
+        if long_df.empty:
+            return pd.DataFrame()
+
+        n = len(long_df)
+        rows: List[Dict] = []
+
+        def add(method: str, desc: str, fail: pd.Series) -> None:
+            k = int(fail.sum())
+            rows.append({"Method": method, "Criterion": desc, "N_Channels": n,
+                         "N_Excluded": k, "Pct_Excluded": round(100.0 * k / n, 2)})
+
+        if "SQI" in long_df.columns:
+            sqi = long_df["SQI"]
+            add("SQI", f"SQI < {sqi_threshold}", (sqi < sqi_threshold) | sqi.isna())
+        if "SCI" in long_df.columns:
+            sci = long_df["SCI"]
+            add("SCI", f"SCI < {sci_threshold}", (sci < sci_threshold) | sci.isna())
+        if "PSP" in long_df.columns:
+            psp = long_df["PSP"]
+            add("PSP", f"PSP < {psp_threshold}", (psp < psp_threshold) | psp.isna())
+        if "SCI" in long_df.columns and "PSP" in long_df.columns:
+            sci, psp = long_df["SCI"], long_df["PSP"]
+            add("SCI+PSP", f"SCI < {combined_sci_threshold} OR PSP < {psp_threshold}",
+                (sci < combined_sci_threshold) | (psp < psp_threshold) | sci.isna() | psp.isna())
+
+        return pd.DataFrame(rows)
+
+    @classmethod
+    def _exclusion_by_group(cls, long_df: pd.DataFrame, group_col: str, thresholds: Dict[str, float]) -> pd.DataFrame:
+        if long_df.empty or group_col not in long_df.columns:
+            return pd.DataFrame()
+
+        rows: List[Dict] = []
+        for value in sorted(long_df[group_col].dropna().unique()):
+            comp = cls._exclusion_comparison(long_df[long_df[group_col] == value], **thresholds)
+            rows += [{group_col: value, **r} for r in comp.to_dict("records")]
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _exclusion_by_gate(long_df: pd.DataFrame) -> pd.DataFrame:
+        """How many observations each exclusion flag caught, and how many ONLY that flag caught.
+        See the module docstring: the three chain flags aren't independent. N_Caught doesn't
+        sum to the final fail count because a channel can trip several gates.
+        """
+        n = len(long_df)
+        if n == 0:
+            return pd.DataFrame()
+
+        labels = {
+            "Flatlined": "Flatlined (step 2: whole-file dead check)",
+            "PartialDropout": "PartialDropout (step 3: windowed dead check)",
+            "HardSQIDiscard": "HardSQIDiscard (step 4: SQI tiebreaker)",
+            "CriterionExcluded": "Active criterion (independent of the chain)",
+        }
+        present = [c for c in _GATE_COLS if c in long_df.columns]
+        flags = {c: long_df[c].fillna(False) for c in present}
+
+        rows: List[Dict] = []
+        for col in present:
+            caught = flags[col]
+            others = [flags[o] for o in present if o != col]
+            alone = (caught & ~pd.concat(others, axis=1).any(axis=1)) if others else caught
+            rows.append({
+                "Gate": labels.get(col, col),
+                "N_Channels": n,
+                "N_Caught": int(caught.sum()),
+                "Pct_Caught": round(100.0 * caught.sum() / n, 2),
+                "N_Caught_By_This_Gate_Alone": int(alone.sum()),
+            })
+
+        if "Status" in long_df.columns:
+            fail = int(_is_fail(long_df).sum())
+            rows.append({"Gate": "Any (final Status == fail)", "N_Channels": n, "N_Caught": fail,
+                         "Pct_Caught": round(100.0 * fail / n, 2), "N_Caught_By_This_Gate_Alone": np.nan})
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _gate_a_funnel(long_df: pd.DataFrame) -> pd.DataFrame:
+        """Observations reaching each stage of the chain. Look here when tuning the SCI/PSP minimums or
+        flag ratios; exclusion_by_gate can't show channels that never reached the chain.
+        """
+        n = len(long_df)
+        if n == 0:
+            return pd.DataFrame()
+
+        def stage(label: str, count: int) -> Dict:
+            return {"Stage": label, "N": count, "Pct_Of_Total": round(100.0 * count / n, 2)}
+
+        rows = [{"Stage": "Total channel observations", "N": n, "Pct_Of_Total": 100.0}]
+        if "SciPspPass" not in long_df.columns:
+            return pd.DataFrame(rows)
+        rows.append(stage("Cleared gate 0 (SCI/PSP precondition)", int(long_df["SciPspPass"].fillna(False).sum())))
+
+        if "GateAFlagged" not in long_df.columns:
+            return pd.DataFrame(rows)
+        flagged = long_df["GateAFlagged"].fillna(False)
+        n_flagged = int(flagged.sum())
+        rows.append(stage("Flagged by step 1 (weak vs. dataset/own history)", n_flagged))
+
+        chain = [c for c in ("Flatlined", "PartialDropout", "HardSQIDiscard") if c in long_df.columns]
+        if chain and flagged.any():
+            via_chain = pd.concat([long_df[c].fillna(False) for c in chain], axis=1).any(axis=1)
+            n_excluded = int((flagged & via_chain).sum())
+            rows.append(stage("  -> excluded by the chain (steps 2-4)", n_excluded))
+            rows.append(stage("  -> kept despite the flag", n_flagged - n_excluded))
+        return pd.DataFrame(rows)
+
+    # ---- cardiac-band amplitude (SD) diagnostics ---------------------------
+
+    @staticmethod
+    def _cardiac_sd_by_sci_threshold(long_df: pd.DataFrame, thresholds) -> pd.DataFrame:
+        """CardiacSD distribution among channels kept at each SCI cutoff. As the cutoff tightens the
+        dead/flat channels drop out and the low percentiles climb: that's the retention/quality tradeoff.
+        """
+        if not _has_cardiac(long_df):
+            return pd.DataFrame()
+        valid = long_df.dropna(subset=["SCI"])
+        total = len(valid)
+        rows = []
+        for thr in sorted({float(t) for t in thresholds}):
+            keep = valid[valid["SCI"] > thr]
+            rows.append({
+                "SCI_Threshold": thr, "N_Channels": total, "N_Retained": len(keep),
+                "Pct_Retained": round(100.0 * len(keep) / total, 2) if total else np.nan,
+                "N_Discarded": total - len(keep),
+                **_sd_stats(keep["CardiacSD"].dropna()),
+            })
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _cardiac_sd_by_channel(long_df: pd.DataFrame, sci_threshold: float) -> pd.DataFrame:
+        """Per-channel cardiac amplitude among SCI > threshold observations, lowest first, as a pct of
+        the dataset median. Surfaces channels that couple well enough to pass SCI but are too flat to
+        carry signal. Channel + CardiacSD_Median are exactly Gate A's per-channel baseline (feed to
+        --channel-median-cardiac-sd-file).
+        """
+        if not _has_cardiac(long_df):
+            return pd.DataFrame()
+        r = long_df.dropna(subset=["SCI", "CardiacSD"])
+        r = r[r["SCI"] > sci_threshold]
+        if r.empty:
+            return pd.DataFrame()
+
+        out = r.groupby("Channel")["CardiacSD"].agg(
+            N="size", CardiacSD_Median="median",
+            CardiacSD_P05=lambda s: s.quantile(0.05), CardiacSD_Min="min",
+        ).reset_index()
+        dataset_median = float(r["CardiacSD"].median())
+        out["Pct_Of_Dataset_Median"] = (
+            (out["CardiacSD_Median"] / dataset_median * 100).round(1) if dataset_median else np.nan)
+        return out.sort_values("CardiacSD_Median").reset_index(drop=True)
+
+    @staticmethod
+    def _cardiac_sd_flagged(long_df: pd.DataFrame, sci_threshold: float,
+                            flatline_ratio: float = _CARDIAC_FLATLINE_RATIO,
+                            low_sd_ratio: float = _CARDIAC_LOW_SD_RATIO) -> pd.DataFrame:
+        """SCI > threshold observations with dead/weak cardiac SD.
+
+        flat_line / weak_for_channel are this sheet's own diagnostics, evaluated on every SCI-passing
+        row whether or not the pipeline flagged it. The Excluded_By_* columns say whether the real gates
+        fired. A row flagged here that tripped no real gate is the "channel 13" pattern: borderline on
+        this diagnostic without ever tripping what actually removes channels.
+        """
+        if not _has_cardiac(long_df):
+            return pd.DataFrame()
+        kept = long_df.dropna(subset=["SCI", "CardiacSD"])
+        kept = kept[kept["SCI"] > sci_threshold].copy()
+        if kept.empty:
+            return pd.DataFrame()
+
+        dataset_median = float(kept["CardiacSD"].median())
+        kept["Channel_Median_SD"] = kept.groupby("Channel")["CardiacSD"].transform("median")
+        kept["Dataset_Median_SD"] = dataset_median
+        kept["flat_line"] = kept["CardiacSD"] < flatline_ratio * dataset_median
+        kept["weak_for_channel"] = kept["CardiacSD"] < low_sd_ratio * kept["Channel_Median_SD"]
+
+        flagged = kept[kept["flat_line"] | kept["weak_for_channel"]].rename(columns={
+            "GateAFlagged": "Flagged_By_Step1",
+            "Flatlined": "Excluded_By_Flatline_Gate",
+            "PartialDropout": "Excluded_By_PartialDropout_Gate",
+            "HardSQIDiscard": "Excluded_By_HardSQI_Gate",
+            "CriterionExcluded": "Excluded_By_Active_Criterion",
+        })
+        keep_cols = [c for c in (
+            "Subject", "Timepoint", "Condition", "Region", "SourceFile", "Channel",
+            "SCI", "PSP", "SQI", "CardiacSD", "CardiacSD_WL1", "CardiacSD_WL2",
+            "Channel_Median_SD", "Dataset_Median_SD", "flat_line", "weak_for_channel",
+            "Flagged_By_Step1", "Excluded_By_Flatline_Gate", "Excluded_By_PartialDropout_Gate",
+            "Excluded_By_HardSQI_Gate", "Excluded_By_Active_Criterion", "Status", "Excluded",
+        ) if c in flagged.columns]
+        return flagged[keep_cols].sort_values("CardiacSD").reset_index(drop=True)
+
+    @staticmethod
+    def _cardiac_sd_by_retention_rule(long_df: pd.DataFrame, sci_threshold: float, psp_threshold: float,
+                                      combined_sci_threshold: float,
+                                      flatline_ratio: float = _CARDIAC_FLATLINE_RATIO) -> pd.DataFrame:
+        """Does adding PSP to an SCI-only cutoff remove the flat channels it leaves in? Each row is a
+        candidate retention rule; N_Flatline counts kept channels with ~no cardiac pulsation
+        (CardiacSD < flatline_ratio * dataset median). NaN metrics count as not retained. The last row
+        is the full pipeline outcome (chain + active criterion), not the criterion alone.
+        """
+        if not _has_cardiac(long_df):
+            return pd.DataFrame()
+        v = long_df.dropna(subset=["SCI", "CardiacSD"])
+        if v.empty:
+            return pd.DataFrame()
+
+        total = len(v)
+        flat_cut = flatline_ratio * float(v["CardiacSD"].median())
+
+        def row(rule: str, desc: str, mask: pd.Series) -> Dict:
+            kept = v[mask]
+            sd = kept["CardiacSD"]
+            return {
+                "Rule": rule, "Criterion": desc, "N_Total": total, "N_Retained": len(kept),
+                "Pct_Retained": round(100.0 * len(kept) / total, 2),
+                "N_Flatline": int((sd < flat_cut).sum()),
+                **_sd_stats(sd, with_p95=False),
+            }
+
+        rows = [row("SCI", f"SCI >= {sci_threshold}", v["SCI"] >= sci_threshold)]
+        if "PSP" in v.columns:
+            rows.append(row("PSP", f"PSP >= {psp_threshold}", v["PSP"] >= psp_threshold))
+            rows.append(row("SCI+PSP", f"SCI >= {combined_sci_threshold} AND PSP >= {psp_threshold}",
+                            (v["SCI"] >= combined_sci_threshold) & (v["PSP"] >= psp_threshold)))
+        if "Status" in v.columns:
+            rows.append(row("Full pipeline", "Status == pass (as processed)",
+                            v["Status"].astype(str).str.lower().eq("pass")))
+        return pd.DataFrame(rows)
+
+    # ---- metadata from paths -----------------------------------------------
+
+    def _extract_metadata(self, path: Path) -> Dict[str, str]:
+        return {"Subject": self._subject(path), "Timepoint": self._visit(path),
+                "Condition": self._condition(path.name), "SourceFile": path.name}
+
+    @staticmethod
+    def _subject(path: Path) -> str:
+        m = re.search(r"AUT_\d{3}", str(path))
+        return m.group(0) if m else _UNKNOWN
+
+    @staticmethod
+    def _visit(path: Path) -> str:
+        """V<digits> token anywhere in the path; letter-adjacent matches (WL1, MOVE) don't count."""
+        m = re.search(r"(?<![A-Za-z])V(\d+)(?![A-Za-z])", str(path))
+        if m:
+            return f"V{m.group(1)}"
+        logger.warning(f"No timepoint in {path.name!r}; using {_UNKNOWN!r}")
+        return _UNKNOWN
+
+    @staticmethod
+    def _condition(filename: str) -> str:
+        clean = _FILENAME_SUFFIX_RE.sub("", filename)
+        clean = _RAW_EXT_RE.sub("", clean)
+        clean = re.sub(r"^[A-Za-z]+_\d+_", "", clean, count=1)                    # subject prefix
+        clean = re.sub(r"^[Vv]\d+_", "", clean, count=1)                          # visit prefix
+        clean = re.split(r"_O[DS](?:_|$)", clean, maxsplit=1, flags=re.I)[0]      # cut at optics marker
+
+        prev = None
+        while prev != clean:
+            prev = clean
+            clean = re.sub(r"_(?:correct(?:ed)?|[Vv]\d+)$", "", clean, flags=re.I)
+
+        tokens = [t for t in clean.split("_") if t]
+        if not tokens:
+            logger.warning(f"No condition in {filename!r}; using {_UNKNOWN!r}")
+            return _UNKNOWN
+        return "_".join(StatisticsCalculator._normalize_condition_token(t) for t in tokens)
+
+    @staticmethod
+    def _normalize_condition_token(tok: str) -> str:
+        if re.fullmatch(r"(?:DT|ST)\d*", tok, re.I):
+            return tok.upper()
+        return tok[:1].upper() + tok[1:].lower()
