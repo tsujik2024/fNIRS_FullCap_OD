@@ -1,12 +1,3 @@
-"""Aggregate per-file processed CSVs and quality reports into batch statistics.
-
-Heads up on reading the gate columns: process_file.py runs Flatlined /
-PartialDropout / HardSQIDiscard only on channels that already cleared SciPspPass
-and were GateAFlagged, so they're a funnel, not independent tests (HardSQIDiscard's
-"caught alone" count always equals its total). CriterionExcluded is the one
-flag independent of the chain. gate_a_funnel shows the stage-by-stage counts.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -31,17 +22,17 @@ OXY = "_oxy"
 DEOXY = "_deoxy"
 
 _METRIC_COLS = ("SQI", "SCI", "PSP")
-# Cardiac-band amplitude; reports from before that patch lack them and the cardiac sheets are skipped
+# Older reports predate these columns; the cardiac sheets are skipped without them.
 _CARDIAC_COLS = ("CardiacSD_WL1", "CardiacSD_WL2", "CardiacSD")
-# Precondition + step-1 flag of the chain; neither excludes anything by itself
-_CHAIN_COLS = ("SciPspPass", "GateAFlagged")
+# Gate 0 and the step-1 flag; neither excludes a channel on its own.
+_CHAIN_COLS = ("SciPass", "GateAFlagged")
 _GATE_COLS = ("Flatlined", "PartialDropout", "HardSQIDiscard", "CriterionExcluded")
 _DIAGNOSTIC_COLS = ("PartialDropoutFraction",)
 
-# Cardiac-SD diagnostics only; these never affect channel exclusion
+# Diagnostics for the cardiac sheets only; none of these affect exclusion.
 _CARDIAC_SCI_THRESHOLDS = (0.50, 0.60, 0.70, 0.75, 0.80, 0.90)
-_CARDIAC_FLATLINE_RATIO = 0.05  # vs. dataset median
-_CARDIAC_LOW_SD_RATIO = 0.20    # vs. the channel's own median
+_CARDIAC_FLATLINE_RATIO = 0.05  # of the dataset median
+_CARDIAC_LOW_SD_RATIO = 0.20    # of the channel's own median
 
 _CH_TO_BASE_REGION = {ch: region.split("_", 1)[0] for ch, region in CHANNEL_TO_REGION.items()}
 
@@ -68,8 +59,8 @@ _UNKNOWN = "Unknown"
 def _read_csv(path: Path) -> Optional[pd.DataFrame]:
     try:
         return pd.read_csv(path)
-    except (OSError, pd.errors.ParserError) as e:
-        logger.warning(f"Failed to read {path}: {e}")
+    except (OSError, pd.errors.ParserError) as exc:
+        logger.warning(f"Failed to read {path}: {exc}")
         return None
 
 
@@ -81,9 +72,13 @@ def _sd_stats(sd: pd.Series, with_p95: bool = True) -> Dict[str, float]:
     keys = ["CardiacSD_Median", "CardiacSD_P05"] + (["CardiacSD_P95"] if with_p95 else []) + ["CardiacSD_Min"]
     if sd.empty:
         return dict.fromkeys(keys, np.nan)
-    vals = {"CardiacSD_Median": sd.median(), "CardiacSD_P05": sd.quantile(0.05),
-            "CardiacSD_P95": sd.quantile(0.95), "CardiacSD_Min": sd.min()}
-    return {k: round(float(vals[k]), 6) for k in keys}
+    values = {
+        "CardiacSD_Median": sd.median(),
+        "CardiacSD_P05": sd.quantile(0.05),
+        "CardiacSD_P95": sd.quantile(0.95),
+        "CardiacSD_Min": sd.min(),
+    }
+    return {k: round(float(values[k]), 6) for k in keys}
 
 
 def _has_cardiac(df: pd.DataFrame) -> bool:
@@ -97,8 +92,10 @@ class StatisticsCalculator:
     # ---- entry points ------------------------------------------------------
 
     def collect_dual_pass_statistics(self, output_base_dir: str | Path) -> pd.DataFrame:
-        """One row per *_processed.csv under output_base_dir. ("Dual pass" is a
-        historical name: this collects whatever filtered/unfiltered runs exist.)
+        """One row per *_processed.csv under output_base_dir.
+
+        "Dual pass" is a leftover name; this collects whichever filtered and
+        unfiltered runs exist.
         """
         filtered, unfiltered = self._find_processed_files(Path(output_base_dir))
         logger.info(f"Found {len(filtered)} filtered and {len(unfiltered)} unfiltered processed CSVs")
@@ -121,18 +118,18 @@ class StatisticsCalculator:
     ) -> Dict[str, pd.DataFrame]:
         """Aggregate per-file quality reports into summary tables.
 
-        Reports are found under with_<method>_filtering/, no_filtering/ or
-        channel_quality/; if a recording appears in several, filtered wins.
+        Reports are read from with_<method>_filtering/, no_filtering/ or
+        channel_quality/; a recording found in several keeps the filtered one.
 
-        The thresholds only drive the cross-method comparison sheets. They do NOT
-        change which channels were excluded at processing time.
+        The thresholds only drive the cross-method comparison sheets. They do
+        not change which channels were excluded at processing time.
 
         Keys: long, per_channel, per_subject, exclusion_comparison,
-        exclusion_by_condition, exclusion_by_region, plus (when the columns exist)
-        exclusion_by_gate, gate_a_funnel, and four cardiac_sd_* sheets. Cardiac
-        amplitude uses the livelier wavelength (max of WL1/WL2), so a channel is
-        dead only when BOTH are flat. cardiac_sd_by_channel is the file to pass to
-        --channel-median-cardiac-sd-file on the next run.
+        exclusion_by_condition, exclusion_by_region, plus, when the columns
+        exist, exclusion_by_gate, gate_a_funnel and the cardiac_sd_* sheets.
+        Cardiac amplitude uses the livelier wavelength (max of WL1/WL2), so a
+        channel only counts as dead when both are flat. cardiac_sd_by_channel is
+        the file to pass as --channel-median-cardiac-sd-file on the next run.
         """
         root = Path(output_base_dir)
         reports = self._find_quality_reports(root)
@@ -140,27 +137,9 @@ class StatisticsCalculator:
             logger.warning(f"No quality reports found under {root}")
             return {}
 
-        chunks = []
-        for path in reports:
-            df = self._read_quality_report(path)
-            if df is None:
-                continue
-            for k, v in self._extract_metadata(path).items():
-                df[k] = v
-            chunks.append(df)
-        if not chunks:
+        long_df = self._build_long_frame(reports)
+        if long_df is None:
             return {}
-
-        long_df = pd.concat(chunks, ignore_index=True)
-        if "Channel" in long_df.columns:
-            long_df["Region"] = long_df["Channel"].map(_CH_TO_BASE_REGION).fillna(_UNKNOWN)
-        if {"CardiacSD_WL1", "CardiacSD_WL2"}.issubset(long_df.columns):
-            long_df["CardiacSD"] = long_df[["CardiacSD_WL1", "CardiacSD_WL2"]].max(axis=1)
-
-        ordered = (["Subject", "Timepoint", "Condition", "Region", "SourceFile", "Channel"]
-                   + list(_METRIC_COLS) + list(_CARDIAC_COLS) + list(_CHAIN_COLS) + list(_GATE_COLS)
-                   + list(_DIAGNOSTIC_COLS) + ["Status", "Excluded", "Method", "Criterion"])
-        long_df = long_df[[c for c in ordered if c in long_df.columns]]
 
         thresholds = {
             "sqi_threshold": sqi_threshold,
@@ -191,11 +170,37 @@ class StatisticsCalculator:
             })
         return result
 
+    def _build_long_frame(self, reports: List[Path]) -> Optional[pd.DataFrame]:
+        chunks = []
+        for path in reports:
+            df = self._read_quality_report(path)
+            if df is None:
+                continue
+            for key, value in self._extract_metadata(path).items():
+                df[key] = value
+            chunks.append(df)
+        if not chunks:
+            return None
+
+        long_df = pd.concat(chunks, ignore_index=True)
+        if "Channel" in long_df.columns:
+            long_df["Region"] = long_df["Channel"].map(_CH_TO_BASE_REGION).fillna(_UNKNOWN)
+        if {"CardiacSD_WL1", "CardiacSD_WL2"}.issubset(long_df.columns):
+            long_df["CardiacSD"] = long_df[["CardiacSD_WL1", "CardiacSD_WL2"]].max(axis=1)
+
+        column_order = (
+            ["Subject", "Timepoint", "Condition", "Region", "SourceFile", "Channel"]
+            + list(_METRIC_COLS) + list(_CARDIAC_COLS) + list(_CHAIN_COLS) + list(_GATE_COLS)
+            + list(_DIAGNOSTIC_COLS) + ["Status", "Excluded", "Method", "Criterion"]
+        )
+        return long_df[[c for c in column_order if c in long_df.columns]]
+
     # ---- writers -----------------------------------------------------------
 
-    def write_summary_sheets(self, stats_df: pd.DataFrame, output_folder: str | Path,
-                             group_by: str = "Condition") -> None:
-        """group_by: "Condition" (legacy summary_<condition>.csv), "Timepoint", or "both"."""
+    def write_summary_sheets(
+        self, stats_df: pd.DataFrame, output_folder: str | Path, group_by: str = "Condition",
+    ) -> None:
+        """group_by: "Condition" (summary_<condition>.csv), "Timepoint", or "both"."""
         if stats_df.empty:
             logger.warning("No statistics to write")
             return
@@ -219,7 +224,7 @@ class StatisticsCalculator:
 
     @staticmethod
     def _write_grouped_summaries(stats_df: pd.DataFrame, out: Path, cols: List[str], group_by: str) -> None:
-        """Condition -> summary_<cond>.csv; Timepoint -> summary_<tp>.csv; both -> summary_<tp>_<cond>.csv."""
+        """Condition -> summary_<cond>.csv, Timepoint -> summary_<tp>.csv, both -> summary_<tp>_<cond>.csv."""
         mode = (group_by or "Condition").strip().lower()
         if mode not in {"condition", "timepoint", "both"}:
             logger.warning(f"Unknown group_by={group_by!r}; using 'Condition'")
@@ -253,7 +258,7 @@ class StatisticsCalculator:
     def _find_processed_files(root: Path) -> Tuple[List[Path], List[Path]]:
         filtered, unfiltered = [], []
         for path in sorted(root.rglob("*_processed.csv")):
-            if any(_FILTERED_DIR_RE.match(p) for p in path.parts):
+            if any(_FILTERED_DIR_RE.match(part) for part in path.parts):
                 filtered.append(path)
             elif _UNFILTERED_DIR in path.parts:
                 unfiltered.append(path)
@@ -263,23 +268,24 @@ class StatisticsCalculator:
 
     @staticmethod
     def _find_quality_reports(root: Path) -> List[Path]:
-        """One report per recording (key: recording dir + source stem).
-        Priority when several exist: filtered > quality-only > unfiltered.
+        """One report per recording, keyed on recording directory + source stem.
+
+        When a recording has several, filtered beats quality-only beats unfiltered.
         """
         chosen: Dict[Tuple[str, str], Tuple[int, Path]] = {}
-        for p in sorted(root.rglob("*_quality_report.csv")):
-            if any(_FILTERED_DIR_RE.match(part) for part in p.parts):
+        for path in sorted(root.rglob("*_quality_report.csv")):
+            if any(_FILTERED_DIR_RE.match(part) for part in path.parts):
                 priority = 0
-            elif _QUALITY_ONLY_DIR in p.parts:
+            elif _QUALITY_ONLY_DIR in path.parts:
                 priority = 1
-            elif _UNFILTERED_DIR in p.parts:
+            elif _UNFILTERED_DIR in path.parts:
                 priority = 2
             else:
                 continue
-            key = (str(p.parent.parent), _FILENAME_SUFFIX_RE.sub("", p.name))
+            key = (str(path.parent.parent), _FILENAME_SUFFIX_RE.sub("", path.name))
             if key not in chosen or chosen[key][0] > priority:
-                chosen[key] = (priority, p)
-        return sorted(p for _, p in chosen.values())
+                chosen[key] = (priority, path)
+        return sorted(path for _, path in chosen.values())
 
     # ---- per-file stats ----------------------------------------------------
 
@@ -299,28 +305,31 @@ class StatisticsCalculator:
         return {**meta, **self._grand_stats(df, half), **self._region_stats(df, half)}
 
     @staticmethod
-    def _means(s: pd.Series, half: int, label: str) -> Dict[str, float]:
-        return {f"{label} Overall Mean": s.mean(),
-                f"{label} First Half Mean": s.iloc[:half].mean(),
-                f"{label} Second Half Mean": s.iloc[half:].mean()}
+    def _means(series: pd.Series, half: int, label: str) -> Dict[str, float]:
+        return {
+            f"{label} Overall Mean": series.mean(),
+            f"{label} First Half Mean": series.iloc[:half].mean(),
+            f"{label} Second Half Mean": series.iloc[half:].mean(),
+        }
 
     @classmethod
     def _grand_stats(cls, df: pd.DataFrame, half: int) -> Dict[str, float]:
-        # process_file.py no longer writes grand_oxy/grand_deoxy, so this comes back empty for its output
-        out: Dict[str, float] = {}
+        # process_file.py no longer writes grand_oxy/grand_deoxy, so this is
+        # empty for its output; it still covers older processed CSVs.
+        stats: Dict[str, float] = {}
         for kind, col in (("Oxy", "grand_oxy"), ("Deoxy", "grand_deoxy")):
             if col in df.columns:
-                out.update(cls._means(df[col], half, f"Grand {kind}"))
-        return out
+                stats.update(cls._means(df[col], half, f"Grand {kind}"))
+        return stats
 
     @classmethod
     def _region_stats(cls, df: pd.DataFrame, half: int) -> Dict[str, float]:
-        out: Dict[str, float] = {}
+        stats: Dict[str, float] = {}
         for region in list(CH_REGION_MAP) + list(CH_REGION_MAP_COMBINED):
-            for kind, sfx in (("Oxy", OXY), ("Deoxy", DEOXY)):
-                if f"{region}{sfx}" in df.columns:
-                    out.update(cls._means(df[f"{region}{sfx}"], half, f"{region} {kind}"))
-        return out
+            for kind, suffix in (("Oxy", OXY), ("Deoxy", DEOXY)):
+                if f"{region}{suffix}" in df.columns:
+                    stats.update(cls._means(df[f"{region}{suffix}"], half, f"{region} {kind}"))
+        return stats
 
     # ---- quality-report aggregation ----------------------------------------
 
@@ -333,18 +342,19 @@ class StatisticsCalculator:
         for col in (*_METRIC_COLS, *_CARDIAC_COLS, *_DIAGNOSTIC_COLS):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        # process_file's SUMMARY row (int counts) makes pandas write these flags as 1/0, not True/False
+        # The SUMMARY row holds integer counts, which makes pandas read the
+        # boolean flag columns back as 1/0 rather than True/False.
         for col in (*_CHAIN_COLS, *_GATE_COLS):
             if col in df.columns:
                 df[col] = df[col].astype(str).str.lower().isin(("true", "1", "1.0"))
-        return df.dropna(subset=["Channel"])  # drops the SUMMARY row
+        return df.dropna(subset=["Channel"])  # also drops the SUMMARY row
 
     @staticmethod
     def _per_channel_quality_summary(long_df: pd.DataFrame) -> pd.DataFrame:
         metrics = [c for c in _METRIC_COLS if c in long_df.columns]
         grouped = long_df.groupby("Channel")
         agg = grouped[metrics].agg(["mean", "median", "min", "max"])
-        agg.columns = [f"{m}_{stat}" for m, stat in agg.columns]
+        agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
         agg["n_observations"] = grouped.size()
         if "Status" in long_df.columns:
             failed = long_df.assign(_fail=_is_fail(long_df)).groupby("Channel")["_fail"].mean()
@@ -356,22 +366,27 @@ class StatisticsCalculator:
         metrics = [c for c in _METRIC_COLS if c in long_df.columns]
         grouped = long_df.groupby("Subject")
         agg = grouped[metrics].agg(["mean", "median"])
-        agg.columns = [f"{m}_{stat}" for m, stat in agg.columns]
+        agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
         agg["n_files"] = grouped["SourceFile"].nunique() if "SourceFile" in long_df.columns else grouped.size()
         agg["n_channel_observations"] = grouped.size()
         if "Status" in long_df.columns:
             failed = long_df.assign(_fail=_is_fail(long_df)).groupby("Subject")["_fail"].sum()
             agg["n_failed_active_criterion"] = failed.astype(int)
             agg["pct_failed_active_criterion"] = (
-                agg["n_failed_active_criterion"] / agg["n_channel_observations"] * 100).round(2)
+                agg["n_failed_active_criterion"] / agg["n_channel_observations"] * 100
+            ).round(2)
         return agg.reset_index().sort_values("Subject")
 
     @staticmethod
-    def _exclusion_comparison(long_df: pd.DataFrame, sqi_threshold: float, sci_threshold: float,
-                              psp_threshold: float, combined_sci_threshold: float) -> pd.DataFrame:
-        """Exclusion rate per literature criterion, re-evaluated on the raw metrics regardless of what
-        actually ran at processing time (that's Status/Excluded; see exclusion_by_gate and
-        gate_a_funnel). NaN counts as fail. Counts are (file, channel) observations.
+    def _exclusion_comparison(
+        long_df: pd.DataFrame, sqi_threshold: float, sci_threshold: float,
+        psp_threshold: float, combined_sci_threshold: float,
+    ) -> pd.DataFrame:
+        """Exclusion rate under each literature criterion, recomputed from the raw metrics.
+
+        Independent of what actually ran at processing time (that's
+        Status/Excluded; see exclusion_by_gate and gate_a_funnel). NaN counts as
+        a fail. Counts are (file, channel) observations.
         """
         if long_df.empty:
             return pd.DataFrame()
@@ -379,10 +394,12 @@ class StatisticsCalculator:
         n = len(long_df)
         rows: List[Dict] = []
 
-        def add(method: str, desc: str, fail: pd.Series) -> None:
-            k = int(fail.sum())
-            rows.append({"Method": method, "Criterion": desc, "N_Channels": n,
-                         "N_Excluded": k, "Pct_Excluded": round(100.0 * k / n, 2)})
+        def add(method: str, description: str, fail: pd.Series) -> None:
+            excluded = int(fail.sum())
+            rows.append({
+                "Method": method, "Criterion": description, "N_Channels": n,
+                "N_Excluded": excluded, "Pct_Excluded": round(100.0 * excluded / n, 2),
+            })
 
         if "SQI" in long_df.columns:
             sqi = long_df["SQI"]
@@ -407,15 +424,17 @@ class StatisticsCalculator:
 
         rows: List[Dict] = []
         for value in sorted(long_df[group_col].dropna().unique()):
-            comp = cls._exclusion_comparison(long_df[long_df[group_col] == value], **thresholds)
-            rows += [{group_col: value, **r} for r in comp.to_dict("records")]
+            comparison = cls._exclusion_comparison(long_df[long_df[group_col] == value], **thresholds)
+            rows += [{group_col: value, **record} for record in comparison.to_dict("records")]
         return pd.DataFrame(rows)
 
     @staticmethod
     def _exclusion_by_gate(long_df: pd.DataFrame) -> pd.DataFrame:
-        """How many observations each exclusion flag caught, and how many ONLY that flag caught.
-        See the module docstring: the three chain flags aren't independent. N_Caught doesn't
-        sum to the final fail count because a channel can trip several gates.
+        """How many observations each exclusion flag caught, and how many only that flag caught.
+
+        The chain flags aren't independent (see the module docstring), and
+        N_Caught won't sum to the final fail count because a channel can trip
+        several gates.
         """
         n = len(long_df)
         if n == 0:
@@ -433,7 +452,7 @@ class StatisticsCalculator:
         rows: List[Dict] = []
         for col in present:
             caught = flags[col]
-            others = [flags[o] for o in present if o != col]
+            others = [flags[other] for other in present if other != col]
             alone = (caught & ~pd.concat(others, axis=1).any(axis=1)) if others else caught
             rows.append({
                 "Gate": labels.get(col, col),
@@ -444,15 +463,19 @@ class StatisticsCalculator:
             })
 
         if "Status" in long_df.columns:
-            fail = int(_is_fail(long_df).sum())
-            rows.append({"Gate": "Any (final Status == fail)", "N_Channels": n, "N_Caught": fail,
-                         "Pct_Caught": round(100.0 * fail / n, 2), "N_Caught_By_This_Gate_Alone": np.nan})
+            failed = int(_is_fail(long_df).sum())
+            rows.append({
+                "Gate": "Any (final Status == fail)", "N_Channels": n, "N_Caught": failed,
+                "Pct_Caught": round(100.0 * failed / n, 2), "N_Caught_By_This_Gate_Alone": np.nan,
+            })
         return pd.DataFrame(rows)
 
     @staticmethod
     def _gate_a_funnel(long_df: pd.DataFrame) -> pd.DataFrame:
-        """Observations reaching each stage of the chain. Look here when tuning the SCI/PSP minimums or
-        flag ratios; exclusion_by_gate can't show channels that never reached the chain.
+        """Observations reaching each stage of the chain.
+
+        The place to look when tuning the SCI minimum or the flag ratios;
+        exclusion_by_gate can't show channels that never entered the chain.
         """
         n = len(long_df)
         if n == 0:
@@ -462,9 +485,9 @@ class StatisticsCalculator:
             return {"Stage": label, "N": count, "Pct_Of_Total": round(100.0 * count / n, 2)}
 
         rows = [{"Stage": "Total channel observations", "N": n, "Pct_Of_Total": 100.0}]
-        if "SciPspPass" not in long_df.columns:
+        if "SciPass" not in long_df.columns:
             return pd.DataFrame(rows)
-        rows.append(stage("Cleared gate 0 (SCI/PSP precondition)", int(long_df["SciPspPass"].fillna(False).sum())))
+        rows.append(stage("Cleared gate 0 (SCI precondition)", int(long_df["SciPass"].fillna(False).sum())))
 
         if "GateAFlagged" not in long_df.columns:
             return pd.DataFrame(rows)
@@ -484,57 +507,66 @@ class StatisticsCalculator:
 
     @staticmethod
     def _cardiac_sd_by_sci_threshold(long_df: pd.DataFrame, thresholds) -> pd.DataFrame:
-        """CardiacSD distribution among channels kept at each SCI cutoff. As the cutoff tightens the
-        dead/flat channels drop out and the low percentiles climb: that's the retention/quality tradeoff.
+        """CardiacSD distribution among channels kept at each SCI cutoff.
+
+        Tightening the cutoff drops the dead and flat channels, so the low
+        percentiles climb; that's the retention/quality tradeoff.
         """
         if not _has_cardiac(long_df):
             return pd.DataFrame()
         valid = long_df.dropna(subset=["SCI"])
         total = len(valid)
+
         rows = []
-        for thr in sorted({float(t) for t in thresholds}):
-            keep = valid[valid["SCI"] > thr]
+        for threshold in sorted({float(t) for t in thresholds}):
+            kept = valid[valid["SCI"] > threshold]
             rows.append({
-                "SCI_Threshold": thr, "N_Channels": total, "N_Retained": len(keep),
-                "Pct_Retained": round(100.0 * len(keep) / total, 2) if total else np.nan,
-                "N_Discarded": total - len(keep),
-                **_sd_stats(keep["CardiacSD"].dropna()),
+                "SCI_Threshold": threshold,
+                "N_Channels": total,
+                "N_Retained": len(kept),
+                "Pct_Retained": round(100.0 * len(kept) / total, 2) if total else np.nan,
+                "N_Discarded": total - len(kept),
+                **_sd_stats(kept["CardiacSD"].dropna()),
             })
         return pd.DataFrame(rows)
 
     @staticmethod
     def _cardiac_sd_by_channel(long_df: pd.DataFrame, sci_threshold: float) -> pd.DataFrame:
-        """Per-channel cardiac amplitude among SCI > threshold observations, lowest first, as a pct of
-        the dataset median. Surfaces channels that couple well enough to pass SCI but are too flat to
-        carry signal. Channel + CardiacSD_Median are exactly Gate A's per-channel baseline (feed to
-        --channel-median-cardiac-sd-file).
+        """Per-channel cardiac amplitude among SCI > threshold observations, weakest first.
+
+        Shows channels that couple well enough to pass SCI but are too flat to
+        carry signal. Channel + CardiacSD_Median is exactly Gate A's per-channel
+        baseline, so this sheet can be fed straight to --channel-median-cardiac-sd-file.
         """
         if not _has_cardiac(long_df):
             return pd.DataFrame()
-        r = long_df.dropna(subset=["SCI", "CardiacSD"])
-        r = r[r["SCI"] > sci_threshold]
-        if r.empty:
+        coupled = long_df.dropna(subset=["SCI", "CardiacSD"])
+        coupled = coupled[coupled["SCI"] > sci_threshold]
+        if coupled.empty:
             return pd.DataFrame()
 
-        out = r.groupby("Channel")["CardiacSD"].agg(
+        out = coupled.groupby("Channel")["CardiacSD"].agg(
             N="size", CardiacSD_Median="median",
             CardiacSD_P05=lambda s: s.quantile(0.05), CardiacSD_Min="min",
         ).reset_index()
-        dataset_median = float(r["CardiacSD"].median())
+        dataset_median = float(coupled["CardiacSD"].median())
         out["Pct_Of_Dataset_Median"] = (
-            (out["CardiacSD_Median"] / dataset_median * 100).round(1) if dataset_median else np.nan)
+            (out["CardiacSD_Median"] / dataset_median * 100).round(1) if dataset_median else np.nan
+        )
         return out.sort_values("CardiacSD_Median").reset_index(drop=True)
 
     @staticmethod
-    def _cardiac_sd_flagged(long_df: pd.DataFrame, sci_threshold: float,
-                            flatline_ratio: float = _CARDIAC_FLATLINE_RATIO,
-                            low_sd_ratio: float = _CARDIAC_LOW_SD_RATIO) -> pd.DataFrame:
-        """SCI > threshold observations with dead/weak cardiac SD.
+    def _cardiac_sd_flagged(
+        long_df: pd.DataFrame, sci_threshold: float,
+        flatline_ratio: float = _CARDIAC_FLATLINE_RATIO, low_sd_ratio: float = _CARDIAC_LOW_SD_RATIO,
+    ) -> pd.DataFrame:
+        """SCI > threshold observations with dead or weak cardiac SD.
 
-        flat_line / weak_for_channel are this sheet's own diagnostics, evaluated on every SCI-passing
-        row whether or not the pipeline flagged it. The Excluded_By_* columns say whether the real gates
-        fired. A row flagged here that tripped no real gate is the "channel 13" pattern: borderline on
-        this diagnostic without ever tripping what actually removes channels.
+        flat_line and weak_for_channel are this sheet's own diagnostics,
+        evaluated on every SCI-passing row whether or not the pipeline flagged
+        it. The Excluded_By_* columns show whether the real gates fired, so a
+        row flagged here that tripped none of them is the borderline case: odd
+        on this diagnostic, never caught by what actually removes channels.
         """
         if not _has_cardiac(long_df):
             return pd.DataFrame()
@@ -556,94 +588,106 @@ class StatisticsCalculator:
             "HardSQIDiscard": "Excluded_By_HardSQI_Gate",
             "CriterionExcluded": "Excluded_By_Active_Criterion",
         })
-        keep_cols = [c for c in (
+        output_cols = [c for c in (
             "Subject", "Timepoint", "Condition", "Region", "SourceFile", "Channel",
             "SCI", "PSP", "SQI", "CardiacSD", "CardiacSD_WL1", "CardiacSD_WL2",
             "Channel_Median_SD", "Dataset_Median_SD", "flat_line", "weak_for_channel",
             "Flagged_By_Step1", "Excluded_By_Flatline_Gate", "Excluded_By_PartialDropout_Gate",
             "Excluded_By_HardSQI_Gate", "Excluded_By_Active_Criterion", "Status", "Excluded",
         ) if c in flagged.columns]
-        return flagged[keep_cols].sort_values("CardiacSD").reset_index(drop=True)
+        return flagged[output_cols].sort_values("CardiacSD").reset_index(drop=True)
 
     @staticmethod
-    def _cardiac_sd_by_retention_rule(long_df: pd.DataFrame, sci_threshold: float, psp_threshold: float,
-                                      combined_sci_threshold: float,
-                                      flatline_ratio: float = _CARDIAC_FLATLINE_RATIO) -> pd.DataFrame:
-        """Does adding PSP to an SCI-only cutoff remove the flat channels it leaves in? Each row is a
-        candidate retention rule; N_Flatline counts kept channels with ~no cardiac pulsation
-        (CardiacSD < flatline_ratio * dataset median). NaN metrics count as not retained. The last row
-        is the full pipeline outcome (chain + active criterion), not the criterion alone.
+    def _cardiac_sd_by_retention_rule(
+        long_df: pd.DataFrame, sci_threshold: float, psp_threshold: float,
+        combined_sci_threshold: float, flatline_ratio: float = _CARDIAC_FLATLINE_RATIO,
+    ) -> pd.DataFrame:
+        """Does adding PSP to an SCI-only cutoff remove the flat channels it leaves in?
+
+        Each row is a candidate retention rule; N_Flatline counts retained
+        channels with almost no cardiac pulsation (CardiacSD below
+        flatline_ratio x the dataset median). NaN metrics count as not
+        retained. The last row is the full pipeline outcome (chain plus active
+        criterion), not the criterion alone.
         """
         if not _has_cardiac(long_df):
             return pd.DataFrame()
-        v = long_df.dropna(subset=["SCI", "CardiacSD"])
-        if v.empty:
+        valid = long_df.dropna(subset=["SCI", "CardiacSD"])
+        if valid.empty:
             return pd.DataFrame()
 
-        total = len(v)
-        flat_cut = flatline_ratio * float(v["CardiacSD"].median())
+        total = len(valid)
+        flat_cutoff = flatline_ratio * float(valid["CardiacSD"].median())
 
-        def row(rule: str, desc: str, mask: pd.Series) -> Dict:
-            kept = v[mask]
+        def summarize(rule: str, description: str, retained: pd.Series) -> Dict:
+            kept = valid[retained]
             sd = kept["CardiacSD"]
             return {
-                "Rule": rule, "Criterion": desc, "N_Total": total, "N_Retained": len(kept),
+                "Rule": rule, "Criterion": description, "N_Total": total, "N_Retained": len(kept),
                 "Pct_Retained": round(100.0 * len(kept) / total, 2),
-                "N_Flatline": int((sd < flat_cut).sum()),
+                "N_Flatline": int((sd < flat_cutoff).sum()),
                 **_sd_stats(sd, with_p95=False),
             }
 
-        rows = [row("SCI", f"SCI >= {sci_threshold}", v["SCI"] >= sci_threshold)]
-        if "PSP" in v.columns:
-            rows.append(row("PSP", f"PSP >= {psp_threshold}", v["PSP"] >= psp_threshold))
-            rows.append(row("SCI+PSP", f"SCI >= {combined_sci_threshold} AND PSP >= {psp_threshold}",
-                            (v["SCI"] >= combined_sci_threshold) & (v["PSP"] >= psp_threshold)))
-        if "Status" in v.columns:
-            rows.append(row("Full pipeline", "Status == pass (as processed)",
-                            v["Status"].astype(str).str.lower().eq("pass")))
+        rows = [summarize("SCI", f"SCI >= {sci_threshold}", valid["SCI"] >= sci_threshold)]
+        if "PSP" in valid.columns:
+            rows.append(summarize("PSP", f"PSP >= {psp_threshold}", valid["PSP"] >= psp_threshold))
+            rows.append(summarize(
+                "SCI+PSP", f"SCI >= {combined_sci_threshold} AND PSP >= {psp_threshold}",
+                (valid["SCI"] >= combined_sci_threshold) & (valid["PSP"] >= psp_threshold),
+            ))
+        if "Status" in valid.columns:
+            rows.append(summarize(
+                "Full pipeline", "Status == pass (as processed)",
+                valid["Status"].astype(str).str.lower().eq("pass"),
+            ))
         return pd.DataFrame(rows)
 
     # ---- metadata from paths -----------------------------------------------
 
     def _extract_metadata(self, path: Path) -> Dict[str, str]:
-        return {"Subject": self._subject(path), "Timepoint": self._visit(path),
-                "Condition": self._condition(path.name), "SourceFile": path.name}
+        return {
+            "Subject": self._subject(path),
+            "Timepoint": self._visit(path),
+            "Condition": self._condition(path.name),
+            "SourceFile": path.name,
+        }
 
     @staticmethod
     def _subject(path: Path) -> str:
-        m = re.search(r"AUT_\d{3}", str(path))
-        return m.group(0) if m else _UNKNOWN
+        match = re.search(r"AUT_\d{3}", str(path))
+        return match.group(0) if match else _UNKNOWN
 
     @staticmethod
     def _visit(path: Path) -> str:
-        """V<digits> token anywhere in the path; letter-adjacent matches (WL1, MOVE) don't count."""
-        m = re.search(r"(?<![A-Za-z])V(\d+)(?![A-Za-z])", str(path))
-        if m:
-            return f"V{m.group(1)}"
+        """V<digits> anywhere in the path, ignoring letter-adjacent hits like WL1 or MOVE."""
+        match = re.search(r"(?<![A-Za-z])V(\d+)(?![A-Za-z])", str(path))
+        if match:
+            return f"V{match.group(1)}"
         logger.warning(f"No timepoint in {path.name!r}; using {_UNKNOWN!r}")
         return _UNKNOWN
 
     @staticmethod
     def _condition(filename: str) -> str:
-        clean = _FILENAME_SUFFIX_RE.sub("", filename)
-        clean = _RAW_EXT_RE.sub("", clean)
-        clean = re.sub(r"^[A-Za-z]+_\d+_", "", clean, count=1)                    # subject prefix
-        clean = re.sub(r"^[Vv]\d+_", "", clean, count=1)                          # visit prefix
-        clean = re.split(r"_O[DS](?:_|$)", clean, maxsplit=1, flags=re.I)[0]      # cut at optics marker
+        name = _FILENAME_SUFFIX_RE.sub("", filename)
+        name = _RAW_EXT_RE.sub("", name)
+        name = re.sub(r"^[A-Za-z]+_\d+_", "", name, count=1)    # subject prefix
+        name = re.sub(r"^[Vv]\d+_", "", name, count=1)          # visit prefix
+        name = re.split(r"_O[DS](?:_|$)", name, maxsplit=1, flags=re.I)[0]  # everything after the optics marker
 
-        prev = None
-        while prev != clean:
-            prev = clean
-            clean = re.sub(r"_(?:correct(?:ed)?|[Vv]\d+)$", "", clean, flags=re.I)
+        previous = None
+        while previous != name:
+            previous = name
+            name = re.sub(r"_(?:correct(?:ed)?|[Vv]\d+)$", "", name, flags=re.I)
 
-        tokens = [t for t in clean.split("_") if t]
+        tokens = [t for t in name.split("_") if t]
         if not tokens:
             logger.warning(f"No condition in {filename!r}; using {_UNKNOWN!r}")
             return _UNKNOWN
         return "_".join(StatisticsCalculator._normalize_condition_token(t) for t in tokens)
 
     @staticmethod
-    def _normalize_condition_token(tok: str) -> str:
-        if re.fullmatch(r"(?:DT|ST)\d*", tok, re.I):
-            return tok.upper()
-        return tok[:1].upper() + tok[1:].lower()
+    def _normalize_condition_token(token: str) -> str:
+        if re.fullmatch(r"(?:DT|ST)\d*", token, re.I):
+            return token.upper()
+        return token[:1].upper() + token[1:].lower()
